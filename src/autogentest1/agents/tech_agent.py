@@ -19,6 +19,7 @@ def create_tech_analyst_agent(settings: Settings) -> AssistantAgent:
         "code cell before issuing conclusions and reference the results succinctly. Provide entry, stop, "
         "target zones and timing windows. If macro narrative disagrees but chart screams reversal, defend "
         "the technical case firmly. Output JSON with phase='Phase 1', status, summary, details (include "
-        "key levels array, code_snippets). Conclude with status='COMPLETE' and cue FundamentalAnalystAgent."
+        "key levels array, code_snippets) and add details.next_agent='MacroAnalystAgent'. Conclude with "
+        "status='COMPLETE' after setting the next_agent."
     )
     return create_llm_agent("TechAnalystAgent", system_prompt, settings)

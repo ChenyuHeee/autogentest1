@@ -79,6 +79,30 @@ def _load_autogen_classes() -> Tuple[Any, Any]:
     return autogen_module.GroupChat, autogen_module.GroupChatManager
 
 
+def _select_next_agent(last_speaker: Any, groupchat: Any) -> Any:
+    """Custom speaker selector honoring the `details.next_agent` hint."""
+
+    if groupchat.messages:
+        last_message = groupchat.messages[-1]
+        payload = last_message.get("content") if isinstance(last_message, dict) else None
+        parsed = _attempt_parse_json(payload)
+        if isinstance(parsed, dict):
+            details = parsed.get("details")
+            if isinstance(details, dict):
+                next_name = details.get("next_agent")
+                if isinstance(next_name, str):
+                    for agent in groupchat.agents:
+                        if agent.name == next_name:
+                            return agent
+
+    if not groupchat.messages or (hasattr(last_speaker, "name") and last_speaker.name == "HeadTraderAgent"):
+        for agent in groupchat.agents:
+            if agent.name == "DataAgent":
+                return agent
+
+    return "auto"
+
+
 def build_conversation_context(symbol: str, days: int, settings: Settings) -> Tuple[Dict[str, Any], Any]:
     """Gather market, fundamental, and risk data to seed the conversation."""
 
@@ -145,7 +169,7 @@ def build_conversation_context(symbol: str, days: int, settings: Settings) -> Tu
                 "description": "All agents reply with a JSON object so downstream roles can parse outputs.",
                 "required_fields": ["phase", "status", "summary", "details"],
                 "status_values": ["IN_PROGRESS", "COMPLETE", "BLOCKED"],
-                "details_schema": "Use nested key/value pairs or arrays; avoid free-form text blocks.",
+                "details_schema": "Use nested key/value pairs or arrays; avoid free-form text blocks. Include a next_agent string when handing off to the next role.",
             }
         },
         "portfolio_state": portfolio_state,
@@ -167,6 +191,20 @@ def build_conversation_context(symbol: str, days: int, settings: Settings) -> Tu
             "Identify monitoring triggers for intraday review, including news-sentiment thresholds.",
             "Ensure compliance and operational readiness before market open.",
         ],
+        "agent_directory": {
+            "Phase 1": [
+                "DataAgent",
+                "TechAnalystAgent",
+                "MacroAnalystAgent",
+                "FundamentalAnalystAgent",
+                "QuantResearchAgent",
+            ],
+            "Phase 2": ["HeadTraderAgent"],
+            "Phase 3": ["PaperTraderAgent"],
+            "Phase 4": ["RiskManagerAgent", "ComplianceAgent"],
+            "Phase 5": ["SettlementAgent"],
+            "Tools": ["ToolsProxy"],
+        },
     }
     return context, history
 
@@ -202,6 +240,8 @@ def _instantiate_group(settings: Settings) -> Tuple[Any, Any, Any]:
             tools_proxy,
         ],
         messages=[],
+        speaker_selection_method=_select_next_agent,
+        allow_repeat_speaker=False,
     )
     manager = GroupChatManager(groupchat=groupchat, llm_config=head_trader.llm_config)
     return head_trader, manager, groupchat

@@ -11,6 +11,14 @@ from autogen.coding import LocalCommandLineCodeExecutor
 
 from ..config.settings import Settings, get_settings
 
+_GLOBAL_JSON_CONTRACT = (
+    "\n\nFORMAT CONTRACT: Output MUST be a single JSON object using double quotes and nothing else. "
+    "The very first non-whitespace character must be '{' and the very last must be '}'. Do NOT "
+    "use code fences, markdown labels, bullets, or commentary. The JSON object must contain EXACTLY "
+    "the keys phase, status, summary, details with values matching the workflow schema. If you are "
+    "unable to comply, respond instead with {\"phase\":\"UNKNOWN\",\"status\":\"BLOCKED\",\"summary\":\"Format error\",\"details\":{}}."
+)
+
 
 def _should_enable_code_execution(settings: Settings, agent_name: str) -> bool:
     return settings.code_execution_enabled and agent_name in set(settings.code_execution_agents)
@@ -67,9 +75,11 @@ def create_llm_agent(name: str, system_prompt: str, settings: Settings | None = 
     if effective_settings.deepseek_base_url and not os.environ.get("OPENAI_BASE_URL"):
         os.environ["OPENAI_BASE_URL"] = effective_settings.deepseek_base_url
 
+    system_message = system_prompt + _GLOBAL_JSON_CONTRACT
+
     return AssistantAgent(
         name=name,
-        system_message=system_prompt,
+        system_message=system_message,
         llm_config=build_llm_config(effective_settings, agent_name=name),
         code_execution_config=code_execution_config or False,
     )

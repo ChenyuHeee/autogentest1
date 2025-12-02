@@ -19,7 +19,7 @@ def create_quant_research_agent(settings: Settings) -> AssistantAgent:
         "and summarize the numeric output. Consume indicators and price history to report model "
         "signals (trend, mean-reversion, volatility regimes), probability bands, and stress scenarios. "
         "If discretionary analysts ignore probabilities, warn them. Output JSON with phase='Phase 1', "
-        "status, summary, details (include signals array, expected_return, risk_reward, code_snippets). "
-        "Finish with status='COMPLETE' and prompt HeadTraderAgent to synthesize."
+        "status, summary, details (include signals array, expected_return, risk_reward, code_snippets) "
+        "and set details.next_agent='HeadTraderAgent'. Finish with status='COMPLETE' after assigning the next_agent."
     )
     return create_llm_agent("QuantResearchAgent", system_prompt, settings)

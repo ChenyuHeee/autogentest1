@@ -17,7 +17,7 @@ def create_macro_analyst_agent(settings: Settings) -> AssistantAgent:
         "chart patterns as superstition. Phase: 1 (Research Briefing). Scrutinize the DataAgent's "
         "numbers, challenge any short-term optimism if the macro regime disagrees. Deliver base and "
         "alternate macro narratives, clearly stating risks that would invalidate the trade. Output JSON "
-        "with phase='Phase 1', status, summary, details; end with status='COMPLETE' and invite the "
-        "FundamentalAnalystAgent to weigh in."
+        "with phase='Phase 1', status, summary, details, and include details.next_agent='FundamentalAnalystAgent'. "
+        "After setting next_agent, end with status='COMPLETE'."
     )
     return create_llm_agent("MacroAnalystAgent", system_prompt, settings)

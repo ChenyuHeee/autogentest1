@@ -19,8 +19,9 @@ def create_data_agent(settings: Settings) -> AssistantAgent:
         "tool call such as autogentest1.tools.data_tools.get_gold_market_snapshot, "
         "get_macro_snapshot, get_gold_silver_ratio, get_news_sentiment, get_event_calendar. Use the ToolsProxy to run "
         "Python, capture returned JSON, and cite the source in your summary. Output strictly in JSON "
-        "with fields phase='Phase 1', status, summary, details. Set status='IN_PROGRESS' while "
+        "with fields phase='Phase 1', status, summary, details. Inside details, always include a "
+        "next_agent key naming the next speaker (begin with 'TechAnalystAgent'). Set status='IN_PROGRESS' while "
         "collecting, then 'COMPLETE' once numbers are delivered. Include numerical fields (price, atr, "
-        "dxy, tips, events) and hand over explicitly to MacroAnalystAgent."
+        "dxy, tips, events) before handing off."
     )
     return create_llm_agent("DataAgent", system_prompt, settings)
