@@ -15,7 +15,8 @@ dependencies = [
     "python-dotenv>=1.0",
     "matplotlib>=3.8",
     "plotly>=5.18",
-    "json-repair>=0.2"
+    "json-repair>=0.2",
+    "requests-cache>=1.2",
 ]
 
 [project.optional-dependencies]

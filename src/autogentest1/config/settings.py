@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     deepseek_model: str = Field("deepseek-chat")
     deepseek_base_url: str = Field("https://api.deepseek.com/v1")
     data_provider: str = Field("yfinance")
+    data_mode: str = Field("hybrid")
     default_symbol: str = Field("XAUUSD")
     default_days: int = Field(14)
     log_level: str = Field("INFO")
@@ -39,6 +40,24 @@ class Settings(BaseSettings):
     local_model_base_url: str | None = Field("http://127.0.0.1:11434/v1")
     local_model_api_key: str | None = Field(None)
     local_model_agents: List[str] = Field(default_factory=list)
+    code_execution_enabled: bool = Field(True)
+    code_execution_agents: List[str] = Field(default_factory=lambda: [
+        "QuantResearchAgent",
+        "TechAnalystAgent",
+    ])
+    code_execution_timeout: int = Field(90)
+    code_execution_workdir: str | None = Field(None)
+    workflow_format_retry_limit: int = Field(2)
+    workflow_max_plan_retries: int = Field(3)
+    market_data_max_age_minutes: int = Field(1440)
+    human_override_timeout_seconds: int = Field(120)
+    market_data_cache_minutes: int = Field(10)
+    market_data_retry_total: int = Field(4)
+    market_data_retry_backoff: float = Field(1.0)
+    news_watcher_enabled: bool = Field(False)
+    news_watcher_poll_seconds: int = Field(300)
+    news_watcher_keywords: List[str] = Field(default_factory=lambda: ["war", "fed", "cpi", "rate", "hike"])
+    news_watcher_vol_threshold: float = Field(0.4)
     alpha_vantage_api_key: str | None = Field(
         None,
         validation_alias=AliasChoices("alpha_vantage_api_key", "alphavantage_api_key", "ALPHAVANTAGE_API_KEY"),
@@ -73,7 +92,12 @@ class Settings(BaseSettings):
 
         return init_settings, env_settings, dotenv_settings, file_secret_settings
 
-    @field_validator("local_model_agents", mode="before")
+    @field_validator(
+        "local_model_agents",
+        "code_execution_agents",
+        "news_watcher_keywords",
+        mode="before",
+    )
     @classmethod
     def _parse_local_model_agents(cls, value: object) -> List[str]:
         if value is None:
@@ -83,6 +107,36 @@ class Settings(BaseSettings):
         if isinstance(value, str):
             return [item.strip() for item in value.split(",") if item.strip()]
         return []
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_numeric_bounds(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        coerced = dict(data)
+        if "workflow_format_retry_limit" in coerced:
+            coerced["workflow_format_retry_limit"] = max(1, int(coerced["workflow_format_retry_limit"]))
+        if "workflow_max_plan_retries" in coerced:
+            coerced["workflow_max_plan_retries"] = max(1, int(coerced["workflow_max_plan_retries"]))
+        if "news_watcher_poll_seconds" in coerced:
+            coerced["news_watcher_poll_seconds"] = max(30, int(coerced["news_watcher_poll_seconds"]))
+        if "market_data_max_age_minutes" in coerced:
+            coerced["market_data_max_age_minutes"] = max(1, int(coerced["market_data_max_age_minutes"]))
+        if "code_execution_timeout" in coerced:
+            coerced["code_execution_timeout"] = max(10, int(coerced["code_execution_timeout"]))
+        if "human_override_timeout_seconds" in coerced:
+            coerced["human_override_timeout_seconds"] = max(30, int(coerced["human_override_timeout_seconds"]))
+        if "news_watcher_vol_threshold" in coerced:
+            coerced["news_watcher_vol_threshold"] = max(0.05, float(coerced["news_watcher_vol_threshold"]))
+        if "market_data_cache_minutes" in coerced:
+            coerced["market_data_cache_minutes"] = max(1, int(coerced["market_data_cache_minutes"]))
+        if "market_data_retry_total" in coerced:
+            coerced["market_data_retry_total"] = max(0, int(coerced["market_data_retry_total"]))
+        if "market_data_retry_backoff" in coerced:
+            coerced["market_data_retry_backoff"] = max(0.0, float(coerced["market_data_retry_backoff"]))
+        if "data_mode" in coerced:
+            coerced["data_mode"] = str(coerced["data_mode"]).lower()
+        return coerced
 
     @model_validator(mode="before")
     @classmethod

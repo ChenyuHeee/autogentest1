@@ -3,11 +3,13 @@ pandas>=2.0
 numpy>=1.26
 yfinance>=0.2
 ta>=0.11
+feedparser>=6.0
 pydantic>=2.5
 python-dotenv>=1.0
 matplotlib>=3.8
 plotly>=5.18
 json-repair>=0.2
+requests-cache>=1.2
 
 [dev]
 pytest>=7.4

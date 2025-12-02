@@ -9,11 +9,13 @@ Requires-Dist: pandas>=2.0
 Requires-Dist: numpy>=1.26
 Requires-Dist: yfinance>=0.2
 Requires-Dist: ta>=0.11
+Requires-Dist: feedparser>=6.0
 Requires-Dist: pydantic>=2.5
 Requires-Dist: python-dotenv>=1.0
 Requires-Dist: matplotlib>=3.8
 Requires-Dist: plotly>=5.18
 Requires-Dist: json-repair>=0.2
+Requires-Dist: requests-cache>=1.2
 Provides-Extra: dev
 Requires-Dist: pytest>=7.4; extra == "dev"
 Requires-Dist: pytest-asyncio>=0.21; extra == "dev"
@@ -32,6 +34,12 @@ Requires-Dist: pytest-asyncio>=0.21; extra == "dev"
 - 所有上下文数据与代理回复均约定为 JSON 结构，便于解析与留痕。
 - Risk/Compliance 设有回退闭环，可否决并强制 HeadTrader 与 PaperTrader 重新规划。
 - SettlementAgent 会调用工具更新本地 `portfolio_state`，形成日度记忆。
+- Quant 与 Tech 角色具备内置 Python 代码执行沙盒，自动运行计算脚本并引用结果。
+- 市场数据接入采用适配器模式，可在 `yfinance`、IBKR 等供应商间切换并校验实时性。
+- 行情服务集成 `requests-cache`、指数退避重试与 Mock 回退（通过 `DATA_MODE` 控制），缓解限流导致的失败。
+- Workflow 输出启用 Pydantic 严格校验，失败时自动重试并捕获格式错误。
+- 风控分歧支持最大重试阈值与人工仲裁接口，必要时由 AdminUserProxy 介入。
+- 新增 NewsWatcher 事件驱动服务，可在突发新闻触发风险快审（`--watch-news`）。
 
 ## 日常沟通节奏
 工作流遵循真实交易台的晨会流程，确保信息逐级传递与责任明确：
@@ -67,9 +75,9 @@ Requires-Dist: pytest-asyncio>=0.21; extra == "dev"
 ## 本地模型集成
 - 适配示例：MacBook M4 24G 可运行 Qwen2.5-14B-Instruct（量化后约 9–10GB）。
 - 启动步骤：安装 `ollama` 或 `llama.cpp` 推理服务 → 拉取模型 → 启动本地 HTTP 接口（默认 `http://127.0.0.1:11434/v1`）。
-- 配置方式：在 `.env` 中设置 `LOCAL_MODEL_ENABLED=true`，填写 `LOCAL_MODEL_NAME`、`LOCAL_MODEL_BASE_URL`、`LOCAL_MODEL_AGENTS`（如 `DataAgent,MacroAnalystAgent,QuantResearchAgent`）。
+- 配置方式：在 `.env` 中设置 `LOCAL_MODEL_ENABLED=true`，填写 `LOCAL_MODEL_NAME`（示例：`qwen2.5:14b-instruct-q4_K_M`）、`LOCAL_MODEL_BASE_URL`、`LOCAL_MODEL_AGENTS`（如 `DataAgent,MacroAnalystAgent,QuantResearchAgent`）。
 - 运行逻辑：被列入 `LOCAL_MODEL_AGENTS` 的角色优先调用本地模型，失败时自动回退至 DeepSeek；其余角色仍直接使用 DeepSeek。
-- 建议分工：让 Phase 1 的研究角色、Phase 4 风控初审等高频任务落在本地模型，关键决策仍交由云端模型兜底。*** End Patch
+- 建议分工：让 Phase 1 的研究角色、Phase 4 风控初审等高频任务落在本地模型，关键决策仍交由云端模型兜底。
 
 ## 智能体编制
 - **HeadTraderAgent**：整合所有研究观点并定稿交易计划。
@@ -95,17 +103,26 @@ Requires-Dist: pytest-asyncio>=0.21; extra == "dev"
    ```bash
    python -m autogentest1.main --days 14 --symbol XAUUSD
    ```
+5. 启动事件监听（可选）：
+   ```bash
+   python -m autogentest1.main --watch-news
+   ```
 
 关键环境变量（`.env`）：
 
 ```
 DEEPSEEK_API_KEY=...
 DEEPSEEK_MODEL=deepseek-chat
+DATA_MODE=hybrid
 MAX_POSITION_OZ=5000
 STRESS_VAR_MILLIONS=3.0
 DAILY_DRAWDOWN_PCT=3.0
 DEFAULT_POSITION_OZ=1200
 PNL_TODAY_MILLIONS=0.4
+MARKET_DATA_MAX_AGE_MINUTES=1440
+MARKET_DATA_CACHE_MINUTES=10
+MARKET_DATA_RETRY_TOTAL=4
+MARKET_DATA_RETRY_BACKOFF=1.0
 ```
 
 ## 开发说明

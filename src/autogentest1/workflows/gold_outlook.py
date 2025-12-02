@@ -6,8 +6,9 @@ import json
 from importlib import import_module
 from math import isnan
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Tuple
 
+from ..agents.admin_agent import create_admin_proxy
 from ..agents.base import create_user_proxy
 from ..agents.compliance_agent import create_compliance_agent
 from ..agents.data_agent import create_data_agent
@@ -20,16 +21,18 @@ from ..agents.strategy_agent import create_strategy_agent
 from ..agents.supervisor_agent import create_head_trader_agent
 from ..agents.tech_agent import create_tech_analyst_agent
 from ..config.settings import Settings, get_settings
+from ..services.exceptions import DataProviderError, DataStalenessError, WorkflowFormatError
 from ..services.fundamentals import collect_fundamental_snapshot
 from ..services.indicators import compute_indicators
 from ..services.macro_feed import collect_macro_highlights
 from ..services.market_data import fetch_price_history, price_history_payload
-from ..services.state import load_portfolio_state, update_portfolio_state
 from ..services.operations import build_settlement_checklist
 from ..services.risk import RiskLimits, build_risk_snapshot
 from ..services.sentiment import collect_sentiment_snapshot
+from ..services.state import load_portfolio_state, update_portfolio_state
 from ..utils.logging import configure_logging, get_logger
 from ..utils.plotting import plot_price_history
+from ..utils.response_validation import validate_workflow_response
 
 logger = get_logger(__name__)
 
@@ -168,19 +171,8 @@ def build_conversation_context(symbol: str, days: int, settings: Settings) -> Tu
     return context, history
 
 
-def run_gold_outlook(symbol: str, days: int, *, settings: Settings | None = None) -> Dict[str, Any]:
-    """Execute the multi-agent workflow and return the final response payload."""
-
-    settings = settings or get_settings()
-    configure_logging(settings.log_level)
-    logger.info("Starting gold outlook workflow for %s (%d days)", symbol, days)
-
-    context_payload, history = build_conversation_context(symbol, days, settings)
-
-    outputs_dir = Path(__file__).resolve().parent.parent / "outputs"
-    chart_path = plot_price_history(history, outputs_dir, symbol)
-    if chart_path:
-        context_payload["chart"] = str(chart_path)
+def _instantiate_group(settings: Settings) -> Tuple[Any, Any, Any]:
+    """Create a fresh group chat configuration for each workflow attempt."""
 
     head_trader = create_head_trader_agent(settings)
     data_agent = create_data_agent(settings)
@@ -212,8 +204,56 @@ def run_gold_outlook(symbol: str, days: int, *, settings: Settings | None = None
         messages=[],
     )
     manager = GroupChatManager(groupchat=groupchat, llm_config=head_trader.llm_config)
+    return head_trader, manager, groupchat
 
-    kickoff_message = (
+
+def _count_rejections(messages: List[Dict[str, Any]]) -> int:
+    rejection_statuses = {"REJECTED", "BLOCKED"}
+    total = 0
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        parsed = _attempt_parse_json(content)
+        if isinstance(parsed, dict) and parsed.get("status") in rejection_statuses:
+            total += 1
+    return total
+
+
+def _solicit_human_override(reason: str, settings: Settings) -> Dict[str, Any]:
+    admin_proxy = create_admin_proxy()
+    prompt = (
+        "Automated negotiation exhausted the retry limit. Reason: "
+        f"{reason}. Provide override JSON with fields decision (FORCE_EXECUTE | STAND_DOWN | CUSTOM) "
+        "and optional notes."
+    )
+    raw = admin_proxy.get_human_input(prompt)
+    try:
+        decision = json.loads(raw)
+        if isinstance(decision, dict):
+            return decision
+    except json.JSONDecodeError:
+        logger.warning("Admin override response was not valid JSON; treating as CUSTOM note")
+    return {"decision": "CUSTOM", "notes": raw}
+
+
+def run_gold_outlook(symbol: str, days: int, *, settings: Settings | None = None) -> Dict[str, Any]:
+    """Execute the multi-agent workflow and return the final response payload."""
+
+    settings = settings or get_settings()
+    configure_logging(settings.log_level)
+    logger.info("Starting gold outlook workflow for %s (%d days)", symbol, days)
+
+    try:
+        context_payload, history = build_conversation_context(symbol, days, settings)
+    except (DataStalenessError, DataProviderError) as exc:
+        logger.error("Aborting workflow due to data quality issue: %s", exc)
+        raise
+
+    outputs_dir = Path(__file__).resolve().parent.parent / "outputs"
+    chart_path = plot_price_history(history, outputs_dir, symbol)
+    if chart_path:
+        context_payload["chart"] = str(chart_path)
+
+    base_message = (
         "Daily pre-market call. Follow the workflow_sequence in the context JSON. Ensure each phase "
         "completes before moving on. When a phase is done, explicitly tag it as COMPLETE so the next "
         "role can proceed. If RiskManagerAgent or ComplianceAgent respond with status='REJECTED' or "
@@ -223,18 +263,58 @@ def run_gold_outlook(symbol: str, days: int, *, settings: Settings | None = None
         "Portfolio Update instructions using the provided tools. Context JSON:\n" + json.dumps(context_payload, indent=2)
     )
 
-    final_response = head_trader.initiate_chat(manager, message=kickoff_message)
+    max_attempts = max(1, settings.workflow_format_retry_limit)
+    attempt = 0
+    format_error: str | None = None
+    parsed_response: Dict[str, Any] | None = None
+    final_response: Any = None
+    last_groupchat: Any = None
 
-    parsed_response = _attempt_parse_json(final_response)
+    while attempt < max_attempts:
+        head_trader, manager, groupchat = _instantiate_group(settings)
+        kickoff_message = base_message
+        if format_error:
+            kickoff_message += (
+                "\n\nFORMAT CORRECTION: Previous output failed validation because "
+                f"{format_error}. Regenerate the entire workflow output strictly as valid JSON matching "
+                "the required schema (phase, status, summary, details)."
+            )
+
+        final_response = head_trader.initiate_chat(manager, message=kickoff_message)
+        candidate = _attempt_parse_json(final_response)
+        is_valid, error = validate_workflow_response(candidate)
+        if is_valid and isinstance(candidate, dict):
+            parsed_response = candidate
+            last_groupchat = groupchat
+            break
+
+        format_error = error or "unknown validation error"
+        attempt += 1
+        last_groupchat = groupchat
+        if attempt >= max_attempts:
+            raise WorkflowFormatError(format_error)
+
     if isinstance(parsed_response, dict):
         portfolio_update = parsed_response.get("portfolio_update")
         if isinstance(portfolio_update, dict):
             update_portfolio_state(portfolio_update)
 
+    rejection_count = _count_rejections(last_groupchat.messages if last_groupchat else [])
+    override_decision: Dict[str, Any] | None = None
+    if rejection_count >= settings.workflow_max_plan_retries:
+        logger.warning("Max plan retries reached (%d); requesting human override", rejection_count)
+        override_decision = _solicit_human_override(
+            reason=f"Received {rejection_count} blocked/rejected responses",
+            settings=settings,
+        )
+
     result = {
         "context": context_payload,
         "response": final_response,
         "response_parsed": parsed_response,
+        "format_attempts": attempt + 1,
+        "rejection_count": rejection_count,
+        "override_decision": override_decision,
     }
     logger.info("Workflow completed")
     return result

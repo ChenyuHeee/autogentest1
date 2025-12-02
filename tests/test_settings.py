@@ -29,3 +29,10 @@ def test_local_model_defaults_loaded_from_env(monkeypatch) -> None:
         "FundamentalAnalystAgent",
         "QuantResearchAgent",
     ]
+
+
+def test_code_execution_agents_default(monkeypatch) -> None:
+    monkeypatch.delenv("CODE_EXECUTION_AGENTS", raising=False)
+    settings = Settings(deepseek_api_key="test-key")
+    assert settings.code_execution_enabled is True
+    assert {"QuantResearchAgent", "TechAnalystAgent"}.issubset(set(settings.code_execution_agents))
