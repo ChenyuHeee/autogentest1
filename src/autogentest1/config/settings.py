@@ -60,6 +60,15 @@ class Settings(BaseSettings):
     hard_gate_max_stress_loss_millions: float | None = Field(None)
     hard_gate_correlation_threshold: float | None = Field(0.9)
     hard_gate_require_stop_loss: bool = Field(True)
+    hard_gate_min_stop_distance_pct: float = Field(0.1)
+    hard_gate_max_stop_distance_pct: float = Field(3.0)
+    hard_gate_stop_coverage_ratio: float = Field(1.0)
+    hard_gate_min_liquidity_depth_oz: float | None = Field(1500.0)
+    hard_gate_depth_buffer_ratio: float = Field(1.2)
+    hard_gate_max_spread_bps: float = Field(25.0)
+    hard_gate_max_slippage_bps: float = Field(35.0)
+    hard_gate_liquidity_baseline_oz: float = Field(1000.0)
+    hard_gate_depth_volume_ratio: float = Field(0.05)
     compliance_allowed_instruments: List[str] = Field(
         default_factory=lambda: ["XAUUSD", "GC", "GC=F", "GLD"]
     )
@@ -254,6 +263,26 @@ class Settings(BaseSettings):
             coerced["hard_gate_correlation_threshold"] = max(
                 0.0, min(1.0, float(coerced["hard_gate_correlation_threshold"]))
             )
+        if "hard_gate_min_stop_distance_pct" in coerced:
+            coerced["hard_gate_min_stop_distance_pct"] = max(0.0, float(coerced["hard_gate_min_stop_distance_pct"]))
+        if "hard_gate_max_stop_distance_pct" in coerced:
+            coerced["hard_gate_max_stop_distance_pct"] = max(
+                coerced.get("hard_gate_min_stop_distance_pct", 0.0), float(coerced["hard_gate_max_stop_distance_pct"])
+            )
+        if "hard_gate_stop_coverage_ratio" in coerced:
+            coerced["hard_gate_stop_coverage_ratio"] = max(0.0, min(1.5, float(coerced["hard_gate_stop_coverage_ratio"])) )
+        if "hard_gate_min_liquidity_depth_oz" in coerced and coerced["hard_gate_min_liquidity_depth_oz"] is not None:
+            coerced["hard_gate_min_liquidity_depth_oz"] = max(0.0, float(coerced["hard_gate_min_liquidity_depth_oz"]))
+        if "hard_gate_depth_buffer_ratio" in coerced:
+            coerced["hard_gate_depth_buffer_ratio"] = max(1.0, float(coerced["hard_gate_depth_buffer_ratio"]))
+        if "hard_gate_max_spread_bps" in coerced:
+            coerced["hard_gate_max_spread_bps"] = max(0.0, float(coerced["hard_gate_max_spread_bps"]))
+        if "hard_gate_max_slippage_bps" in coerced:
+            coerced["hard_gate_max_slippage_bps"] = max(0.0, float(coerced["hard_gate_max_slippage_bps"]))
+        if "hard_gate_liquidity_baseline_oz" in coerced:
+            coerced["hard_gate_liquidity_baseline_oz"] = max(1.0, float(coerced["hard_gate_liquidity_baseline_oz"]))
+        if "hard_gate_depth_volume_ratio" in coerced:
+            coerced["hard_gate_depth_volume_ratio"] = max(0.0, min(1.0, float(coerced["hard_gate_depth_volume_ratio"])) )
         if "data_mode" in coerced:
             coerced["data_mode"] = str(coerced["data_mode"]).lower()
         if "rag_chunk_size" in coerced:

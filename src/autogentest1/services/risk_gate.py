@@ -18,6 +18,16 @@ from ..utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+STOP_ORDER_TYPES = {
+    "STOP",
+    "STOP_LIMIT",
+    "STOP_LOSS",
+    "TRAILING_STOP",
+    "STOP_MARKET",
+    "TRAILING_STOP_LIMIT",
+}
+
+
 @dataclass(frozen=True)
 class HardRiskViolation:
     """Structured metadata describing a breached hard limit."""
@@ -96,6 +106,58 @@ def _safe_float(value: Any) -> Optional[float]:
     return None
 
 
+def _normalize_side(raw: Any) -> Optional[str]:
+    side = str(raw or "").upper()
+    if side in {"BUY", "LONG", "BID"}:
+        return "LONG"
+    if side in {"SELL", "SHORT", "ASK"}:
+        return "SHORT"
+    return None
+
+
+def _opposite_side(side: Optional[str]) -> Optional[str]:
+    if side == "LONG":
+        return "SHORT"
+    if side == "SHORT":
+        return "LONG"
+    return None
+
+
+def _extract_order_size(order: Mapping[str, Any]) -> Optional[float]:
+    size = order.get("size_oz") or order.get("size") or order.get("quantity")
+    numeric = _safe_float(size)
+    if numeric is None:
+        return None
+    return abs(numeric)
+
+
+def _extract_price(order: Mapping[str, Any], keys: Iterable[str]) -> Optional[float]:
+    for key in keys:
+        value = _safe_float(order.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _is_stop_order(order: Mapping[str, Any]) -> bool:
+    order_type = str(order.get("type", "")).upper()
+    classification = str(order.get("classification", "")).upper()
+    intent = str(order.get("intent", "")).upper()
+    return (
+        order_type in STOP_ORDER_TYPES
+        or classification in STOP_ORDER_TYPES
+        or intent in STOP_ORDER_TYPES
+    )
+
+
+def _format_side_map(values: Mapping[tuple[str, str], float]) -> Dict[str, Dict[str, float]]:
+    formatted: Dict[str, Dict[str, float]] = {}
+    for (instrument, side), amount in values.items():
+        bucket = formatted.setdefault(instrument, {})
+        bucket[side] = round(float(amount), 4)
+    return formatted
+
+
 def _largest_order_size(orders: Iterable[Mapping[str, Any]]) -> Optional[float]:
     sizes: List[float] = []
     for order in orders:
@@ -129,6 +191,277 @@ def _collect_orders(response: Mapping[str, Any]) -> List[Dict[str, Any]]:
     return []
 
 
+def _extract_primary_direction(response: Mapping[str, Any]) -> Optional[str]:
+    details = _as_dict(response.get("details"))
+    trading_plan = _as_dict(details.get("trading_plan"))
+    base_plan = _as_dict(trading_plan.get("base_plan"))
+    position = _safe_float(base_plan.get("position_oz") or base_plan.get("size_oz"))
+    if position is None or position == 0:
+        return None
+    return "LONG" if position > 0 else "SHORT"
+
+
+def _evaluate_stop_requirements(
+    orders: Iterable[Mapping[str, Any]],
+    *,
+    settings: Settings,
+    primary_direction: Optional[str],
+) -> Dict[str, Any]:
+    exposures: Dict[tuple[str, str], float] = {}
+    coverage: Dict[tuple[str, str], float] = {}
+    distance_samples: List[Dict[str, Any]] = []
+    invalid_direction: List[Dict[str, Any]] = []
+
+    for order in orders:
+        size = _extract_order_size(order)
+        if size is None or size == 0:
+            continue
+        instrument = str(order.get("instrument") or order.get("symbol") or "UNKNOWN").upper()
+        side = _normalize_side(order.get("side")) or "LONG"
+        order_type_stop = _is_stop_order(order)
+
+        entry_price = _extract_price(order, ("entry", "price", "limit", "avg_price"))
+        stop_price = _extract_price(order, ("stop", "stop_price", "trigger", "stopLevel"))
+
+        key = (instrument, side)
+
+        if not order_type_stop:
+            if primary_direction and side != primary_direction:
+                # Treat as exit or hedge orders; monitor but do not require coverage.
+                continue
+            exposures[key] = exposures.get(key, 0.0) + size
+            if stop_price is not None:
+                coverage[key] = coverage.get(key, 0.0) + size
+                if entry_price and entry_price > 0:
+                    distance_pct = abs(entry_price - stop_price) / entry_price * 100
+                    expected_direction_valid = True
+                    if side == "LONG" and stop_price >= entry_price:
+                        expected_direction_valid = False
+                    if side == "SHORT" and stop_price <= entry_price:
+                        expected_direction_valid = False
+                    sample = {
+                        "instrument": instrument,
+                        "side": side,
+                        "distance_pct": distance_pct,
+                    }
+                    if expected_direction_valid:
+                        distance_samples.append(sample)
+                    else:
+                        invalid_direction.append({**sample, "entry": entry_price, "stop": stop_price})
+        else:
+            stop_side = _normalize_side(order.get("side"))
+            cover_side = _opposite_side(stop_side)
+            if cover_side is None:
+                continue
+            if primary_direction and cover_side != primary_direction:
+                continue
+            cover_key = (instrument, cover_side)
+            coverage[cover_key] = coverage.get(cover_key, 0.0) + size
+            if entry_price and stop_price and entry_price > 0:
+                distance_pct = abs(entry_price - stop_price) / entry_price * 100
+                sample = {
+                    "instrument": instrument,
+                    "side": cover_side,
+                    "distance_pct": distance_pct,
+                    "stop_role": "standalone",
+                }
+                # For standalone stops we cannot reliably determine direction, so skip validation.
+                distance_samples.append(sample)
+
+    coverage_ratio_by_key: Dict[tuple[str, str], float] = {}
+    uncovered_by_key: Dict[tuple[str, str], float] = {}
+    total_exposure = 0.0
+    total_coverage = 0.0
+
+    for key, exposure in exposures.items():
+        covered = coverage.get(key, 0.0)
+        total_exposure += exposure
+        total_coverage += min(covered, exposure)
+        if exposure > 0:
+            coverage_ratio_by_key[key] = covered / exposure if exposure else 0.0
+            uncovered = max(0.0, exposure - covered)
+            if uncovered > 0:
+                uncovered_by_key[key] = uncovered
+
+    min_ratio = min(coverage_ratio_by_key.values()) if coverage_ratio_by_key else None
+
+    evaluated: Dict[str, Any] = {
+        "stop_exposure_by_symbol": _format_side_map(exposures),
+        "stop_coverage_by_symbol": _format_side_map(coverage),
+        "stop_coverage_ratio": {
+            instrument: {
+                side: round(float(coverage_ratio_by_key[(instrument, side)]), 4)
+                for side in mapping
+                if (instrument, side) in coverage_ratio_by_key
+            }
+            for instrument, mapping in _format_side_map(exposures).items()
+        },
+        "stop_total_exposure_oz": total_exposure,
+        "stop_total_coverage_oz": total_coverage,
+        "stop_uncovered_oz": sum(uncovered_by_key.values()),
+        "stop_distance_samples": len(distance_samples),
+    }
+
+    if distance_samples:
+        distances = [sample["distance_pct"] for sample in distance_samples]
+        evaluated["stop_distance_min_pct"] = min(distances)
+        evaluated["stop_distance_max_pct"] = max(distances)
+
+    violations: List[HardRiskViolation] = []
+
+    required_ratio = settings.hard_gate_stop_coverage_ratio
+    if required_ratio > 0 and total_exposure > 0 and (min_ratio is None or min_ratio < required_ratio):
+        violations.append(
+            HardRiskViolation(
+                code="STOP_COVERAGE_SHORTFALL",
+                message="Stop-loss coverage is below required ratio",
+                details={
+                    "required_ratio": required_ratio,
+                    "observed_ratios": evaluated["stop_coverage_ratio"],
+                    "uncovered_exposure": _format_side_map(uncovered_by_key),
+                },
+            )
+        )
+
+    max_distance = settings.hard_gate_max_stop_distance_pct
+    if max_distance and distance_samples:
+        too_wide = [sample for sample in distance_samples if sample["distance_pct"] > max_distance]
+        if too_wide:
+            violations.append(
+                HardRiskViolation(
+                    code="STOP_DISTANCE_TOO_WIDE",
+                    message="Stop-loss distance exceeds maximum configured percentage",
+                    limit=max_distance,
+                    details={"samples": too_wide[:5]},
+                )
+            )
+
+    min_distance = settings.hard_gate_min_stop_distance_pct
+    if min_distance and distance_samples:
+        too_tight = [sample for sample in distance_samples if sample["distance_pct"] < min_distance]
+        if too_tight:
+            violations.append(
+                HardRiskViolation(
+                    code="STOP_DISTANCE_TOO_TIGHT",
+                    message="Stop-loss distance is tighter than configured minimum",
+                    limit=min_distance,
+                    details={"samples": too_tight[:5]},
+                )
+            )
+
+    if invalid_direction:
+        violations.append(
+            HardRiskViolation(
+                code="STOP_DIRECTION_INVALID",
+                message="Stop-loss price is on the wrong side of the entry",
+                details={"samples": invalid_direction[:5]},
+            )
+        )
+
+    return {
+        "evaluated": evaluated,
+        "violations": violations,
+        "exposures": exposures,
+    }
+
+
+def _evaluate_liquidity(
+    *,
+    exposures: Mapping[tuple[str, str], float],
+    risk_snapshot: Mapping[str, Any],
+    settings: Settings,
+) -> Dict[str, Any]:
+    liquidity_metrics = _as_dict(risk_snapshot.get("liquidity_metrics"))
+    evaluated: Dict[str, Any] = {}
+    violations: List[HardRiskViolation] = []
+
+    total_exposure = sum(exposures.values())
+    dominant_exposure = max(exposures.values()) if exposures else 0.0
+
+    volume_ratio = _safe_float(liquidity_metrics.get("volume_ratio"))
+    latest_volume = _safe_float(liquidity_metrics.get("latest_volume"))
+    avg_volume = _safe_float(liquidity_metrics.get("avg_volume"))
+    spread_bps = _safe_float(liquidity_metrics.get("spread_bps"))
+    atr_slippage_bps = _safe_float(liquidity_metrics.get("atr_based_slippage_bps"))
+    atr_pct = _safe_float(liquidity_metrics.get("atr_pct"))
+
+    depth_ratio = settings.hard_gate_depth_volume_ratio
+    estimated_depth_oz: Optional[float] = None
+    if latest_volume is not None:
+        estimated_depth_oz = latest_volume * depth_ratio
+    if avg_volume is not None:
+        baseline_depth = avg_volume * depth_ratio
+        estimated_depth_oz = max(estimated_depth_oz or 0.0, baseline_depth)
+
+    estimated_slippage_bps: Optional[float] = None
+    if atr_slippage_bps is not None:
+        scale = max(1.0, dominant_exposure / settings.hard_gate_liquidity_baseline_oz)
+        estimated_slippage_bps = atr_slippage_bps * scale
+    elif spread_bps is not None:
+        scale = max(1.0, dominant_exposure / settings.hard_gate_liquidity_baseline_oz)
+        estimated_slippage_bps = spread_bps * scale
+
+    evaluated.update(
+        {
+            "liquidity_volume_ratio": volume_ratio,
+            "liquidity_spread_bps": spread_bps,
+            "liquidity_estimated_depth_oz": estimated_depth_oz,
+            "liquidity_estimated_slippage_bps": estimated_slippage_bps,
+            "liquidity_atr_pct": atr_pct,
+            "liquidity_total_entry_oz": total_exposure,
+            "liquidity_dominant_exposure_oz": dominant_exposure,
+        }
+    )
+
+    depth_buffer = settings.hard_gate_depth_buffer_ratio
+    required_depth = dominant_exposure * depth_buffer
+
+    if settings.hard_gate_min_liquidity_depth_oz is not None:
+        required_depth = max(required_depth, settings.hard_gate_min_liquidity_depth_oz)
+
+    if estimated_depth_oz is not None and dominant_exposure > 0 and estimated_depth_oz < required_depth:
+        violations.append(
+            HardRiskViolation(
+                code="LIQUIDITY_DEPTH_INSUFFICIENT",
+                message="Estimated market depth is insufficient for planned size",
+                metric=estimated_depth_oz,
+                limit=required_depth,
+                details={
+                    "dominant_exposure": dominant_exposure,
+                    "depth_ratio": depth_ratio,
+                },
+            )
+        )
+
+    if spread_bps is not None and spread_bps > settings.hard_gate_max_spread_bps:
+        violations.append(
+            HardRiskViolation(
+                code="LIQUIDITY_SPREAD_EXCEEDED",
+                message="Bid-ask spread exceeds configured maximum",
+                metric=spread_bps,
+                limit=settings.hard_gate_max_spread_bps,
+            )
+        )
+
+    if (
+        estimated_slippage_bps is not None
+        and estimated_slippage_bps > settings.hard_gate_max_slippage_bps
+    ):
+        violations.append(
+            HardRiskViolation(
+                code="LIQUIDITY_SLIPPAGE_EXCEEDED",
+                message="Projected slippage exceeds configured maximum",
+                metric=estimated_slippage_bps,
+                limit=settings.hard_gate_max_slippage_bps,
+            )
+        )
+
+    return {
+        "evaluated": evaluated,
+        "violations": violations,
+    }
+
+
 def _extract_risk_metrics(response: Mapping[str, Any]) -> Dict[str, Any]:
     details = _as_dict(response.get("details"))
     risk_compliance = _as_dict(details.get("risk_compliance_signoff"))
@@ -153,6 +486,8 @@ def enforce_hard_limits(
     risk_snapshot = _as_dict(context.get("risk_snapshot"))
     risk_metrics = _extract_risk_metrics(response)
     orders = _collect_orders(response)
+    primary_direction = _extract_primary_direction(response)
+    evaluated["primary_direction"] = primary_direction
 
     # -- Position utilization -------------------------------------------------
     position_utilization = _safe_float(risk_metrics.get("position_utilization"))
@@ -212,6 +547,22 @@ def enforce_hard_limits(
                 details={"orders_checked": len(orders)},
             )
         )
+
+    stop_diagnostics = _evaluate_stop_requirements(
+        orders,
+        settings=settings,
+        primary_direction=primary_direction,
+    )
+    evaluated.update(stop_diagnostics["evaluated"])
+    violations.extend(stop_diagnostics["violations"])
+
+    liquidity_diagnostics = _evaluate_liquidity(
+        exposures=stop_diagnostics["exposures"],
+        risk_snapshot=risk_snapshot,
+        settings=settings,
+    )
+    evaluated.update(liquidity_diagnostics["evaluated"])
+    violations.extend(liquidity_diagnostics["violations"])
 
     # -- Stress loss vs limit -------------------------------------------------
     stress_loss = _safe_float(risk_metrics.get("stress_test_worst_loss_millions"))

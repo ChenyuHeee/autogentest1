@@ -195,6 +195,85 @@ def _compute_cross_asset_correlations(
     return diagnostics
 
 
+def _compute_liquidity_metrics(history: Any, latest_price: Optional[float]) -> Dict[str, Any]:
+    """Derive basic liquidity diagnostics from price history."""
+
+    metrics: Dict[str, Any] = {}
+
+    try:  # pragma: no cover - optional dependency resolution
+        from importlib import import_module
+
+        pd = import_module("pandas")
+    except ModuleNotFoundError:
+        return metrics
+
+    if history is None or getattr(history, "empty", True):
+        return metrics
+
+    volume_series = None
+    if "Volume" in history:
+        try:
+            volume_series = pd.Series(history["Volume"].astype(float)).dropna()
+        except Exception:  # pragma: no cover - defensive
+            volume_series = None
+
+    if volume_series is not None and not volume_series.empty:
+        latest_volume = float(volume_series.iloc[-1])
+        avg_volume_lookback = min(len(volume_series), 20)
+        avg_volume = float(volume_series.tail(avg_volume_lookback).mean()) if avg_volume_lookback else None
+        metrics["latest_volume"] = latest_volume
+        if avg_volume is not None and avg_volume > 0:
+            metrics["avg_volume"] = avg_volume
+            metrics["volume_ratio"] = latest_volume / avg_volume if avg_volume else None
+        metrics["volume_observations"] = int(len(volume_series))
+
+    atr_pct: Optional[float] = None
+    if latest_price and "High" in history and "Low" in history and "Close" in history:
+        highs = lows = closes = None
+        try:
+            highs = pd.Series(history["High"].astype(float))
+            lows = pd.Series(history["Low"].astype(float))
+            closes = pd.Series(history["Close"].astype(float))
+            prev_close = closes.shift(1)
+            true_range = pd.concat(
+                [
+                    highs - lows,
+                    (highs - prev_close).abs(),
+                    (lows - prev_close).abs(),
+                ],
+                axis=1,
+            ).max(axis=1)
+            window = min(14, len(true_range))
+            if window >= 3:
+                atr = true_range.rolling(window=window, min_periods=3).mean().dropna()
+                if not atr.empty:
+                    atr_latest = float(atr.iloc[-1])
+                    if atr_latest > 0:
+                        atr_pct = (atr_latest / latest_price) * 100
+                        metrics["atr_window"] = int(window)
+                        metrics["atr_pct"] = atr_pct
+                        metrics["atr_based_slippage_bps"] = atr_pct * 100
+        except Exception:  # pragma: no cover - defensive guard
+            highs = lows = None
+            atr_pct = None
+
+        if highs is not None and lows is not None:
+            try:
+                high = float(highs.iloc[-1])
+                low = float(lows.iloc[-1])
+                if latest_price and latest_price > 0 and high >= low:
+                    spread_bps = ((high - low) / latest_price) * 10_000 / 2
+                    metrics["spread_bps"] = float(max(0.0, spread_bps))
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+    if atr_pct is None and "spread_bps" in metrics:
+        # Provide a proxy slippage estimate using spread when ATR missing.
+        metrics["atr_based_slippage_bps"] = metrics["spread_bps"] * 1.5
+
+    return {key: value for key, value in metrics.items() if value is not None}
+
+
 def build_risk_snapshot(
     symbol: str,
     history: Any,
@@ -204,7 +283,8 @@ def build_risk_snapshot(
     pnl_today_millions: float,
     benchmark_series: Optional[Dict[str, "pd.Series"]] = None,
     correlation_targets: Sequence[CorrelationTarget] = DEFAULT_CORRELATION_TARGETS,
-    correlation_window: int = 20,
+    correlation_window: Optional[int] = None,
+    correlation_windows: Optional[Sequence[int]] = None,
     scenario_shocks: Sequence[ScenarioShock] = DEFAULT_SCENARIO_SHOCKS,
     news_snapshot: Optional[Mapping[str, Any]] = None,
     apply_news_adjustment: bool = True,
@@ -235,6 +315,12 @@ def build_risk_snapshot(
             logger.warning("新闻驱动风险参数调节失败：%s", exc)
             effective_limits = limits
 
+    if correlation_windows is None:
+        if correlation_window is not None:
+            correlation_windows = (int(correlation_window),)
+        else:
+            correlation_windows = (20, 60, 120)
+
     if history.empty:
         logger.warning("缺少行情数据，无法计算风险快照：%s", symbol)
         vol_annualized: Optional[float] = None
@@ -242,6 +328,7 @@ def build_risk_snapshot(
         var_99: Optional[float] = None
         scenario_outcomes: List[Dict[str, Any]] = []
         cross_asset_correlations: List[Dict[str, Any]] = []
+        liquidity_metrics: Dict[str, Any] = {}
     else:
         close_series = pd.Series(history["Close"].astype(float))
         latest_price = float(close_series.iloc[-1])
@@ -265,17 +352,23 @@ def build_risk_snapshot(
             portfolio_var_millions = float(abs(var_99) * latest_price * current_position_oz / 1_000_000)
 
         if benchmark_series is None:
-            lookback = max(len(close_series) + correlation_window, correlation_window * 3, 60)
+            max_window = max(correlation_windows) if correlation_windows else 20
+            lookback = max(len(close_series) + max_window, max_window * 3, 60)
             benchmark_series = _fetch_benchmark_series(correlation_targets, lookback_days=lookback)
 
-        cross_asset_correlations = _compute_cross_asset_correlations(
-            close_series,
-            benchmark_series,
-            targets=[
-                CorrelationTarget(symbol=target.symbol, label=target.label, window=correlation_window)
-                for target in correlation_targets
-            ],
-        )
+        cross_asset_correlations: List[Dict[str, Any]] = []
+        for window in correlation_windows:
+            diagnostics = _compute_cross_asset_correlations(
+                close_series,
+                benchmark_series,
+                targets=[
+                    CorrelationTarget(symbol=target.symbol, label=target.label, window=max(2, int(window)))
+                    for target in correlation_targets
+                ],
+            )
+            cross_asset_correlations.extend(diagnostics)
+
+        liquidity_metrics = _compute_liquidity_metrics(history, latest_price)
 
     utilization = (
         current_position_oz / effective_limits.max_position_oz if effective_limits.max_position_oz else None
@@ -328,6 +421,7 @@ def build_risk_snapshot(
         "var_limit_utilization": var_limit_utilization,
         "scenario_outcomes": scenario_outcomes,
         "cross_asset_correlations": cross_asset_correlations,
+        "liquidity_metrics": liquidity_metrics,
         "risk_alerts": risk_alerts,
         "latest_price": latest_price,
         "base_limits": {
