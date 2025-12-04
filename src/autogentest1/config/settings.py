@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     code_execution_timeout: int = Field(90)
     code_execution_workdir: str | None = Field(None)
     workflow_format_retry_limit: int = Field(2)
+    workflow_max_rounds: int = Field(30)
     workflow_max_plan_retries: int = Field(3)
     market_data_max_age_minutes: int = Field(1440)
     human_override_timeout_seconds: int = Field(120)
@@ -190,6 +191,8 @@ class Settings(BaseSettings):
             coerced["workflow_format_retry_limit"] = max(1, int(coerced["workflow_format_retry_limit"]))
         if "workflow_max_plan_retries" in coerced:
             coerced["workflow_max_plan_retries"] = max(1, int(coerced["workflow_max_plan_retries"]))
+        if "workflow_max_rounds" in coerced:
+            coerced["workflow_max_rounds"] = max(10, int(coerced["workflow_max_rounds"]))
         if "news_watcher_poll_seconds" in coerced:
             coerced["news_watcher_poll_seconds"] = max(30, int(coerced["news_watcher_poll_seconds"]))
         if "market_data_max_age_minutes" in coerced:

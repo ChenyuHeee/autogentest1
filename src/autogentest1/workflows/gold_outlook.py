@@ -6,7 +6,7 @@ import json
 from importlib import import_module
 from math import isnan
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
 
 from ..agents.admin_agent import create_admin_proxy
 from ..agents.base import create_user_proxy
@@ -16,6 +16,7 @@ from ..agents.fundamental_agent import create_fundamental_analyst_agent
 from ..agents.macro_agent import create_macro_analyst_agent
 from ..agents.quant_agent import create_quant_research_agent
 from ..agents.risk_agent import create_risk_manager_agent
+from ..agents.scribe_agent import create_scribe_agent
 from ..agents.settlement_agent import create_settlement_agent
 from ..agents.strategy_agent import create_strategy_agent
 from ..agents.supervisor_agent import create_head_trader_agent
@@ -36,6 +37,63 @@ from ..utils.response_validation import validate_workflow_response
 
 logger = get_logger(__name__)
 
+PRIMARY_AGENT_SEQUENCE: Tuple[str, ...] = (
+    "DataAgent",
+    "TechAnalystAgent",
+    "MacroAnalystAgent",
+    "FundamentalAnalystAgent",
+    "QuantResearchAgent",
+    "HeadTraderAgent",
+    "PaperTraderAgent",
+    "RiskManagerAgent",
+    "ComplianceAgent",
+    "SettlementAgent",
+)
+
+SCRIBE_AGENT_NAME = "ScribeAgent"
+
+SELF_HANDOFF_ALLOWED: Tuple[str, ...] = ("ToolsProxy",)
+
+
+def _resolve_agent(name: str, agents: Iterable[Any]) -> Any | None:
+    """Return the agent instance matching the given name if present."""
+
+    for agent in agents:
+        if getattr(agent, "name", None) == name:
+            return agent
+    return None
+
+
+def _get_next_primary_after(name: str | None) -> str | None:
+    if not name:
+        return PRIMARY_AGENT_SEQUENCE[0] if PRIMARY_AGENT_SEQUENCE else None
+    try:
+        idx = PRIMARY_AGENT_SEQUENCE.index(name)
+    except ValueError:
+        return None
+    if idx + 1 < len(PRIMARY_AGENT_SEQUENCE):
+        return PRIMARY_AGENT_SEQUENCE[idx + 1]
+    return None
+
+
+def _patch_next_agent_hint(message: Any, next_name: str) -> None:
+    """Update the sender payload so details.next_agent mirrors actual routing."""
+
+    if not isinstance(message, dict) or not next_name:
+        return
+    content = message.get("content")
+    parsed = _attempt_parse_json(content)
+    if not isinstance(parsed, dict):
+        return
+    details = parsed.get("details")
+    if not isinstance(details, dict):
+        details = {}
+        parsed["details"] = details
+    if details.get("next_agent") == next_name:
+        return
+    details["next_agent"] = next_name
+    message["content"] = json.dumps(parsed, separators=(",", ":"))
+
 
 def _clean_numeric(value: Any) -> Any:
     """Coerce numeric types into JSON-safe floats."""
@@ -51,6 +109,20 @@ def _clean_numeric(value: Any) -> Any:
 def _attempt_parse_json(payload: Any) -> Any:
     """Best-effort JSON parsing with optional repair."""
 
+    if hasattr(payload, "summary"):
+        summary = getattr(payload, "summary")
+        if isinstance(summary, str) and summary.strip():
+            payload = summary
+
+    if not isinstance(payload, (dict, list, str)) and hasattr(payload, "chat_history"):
+        history = getattr(payload, "chat_history")
+        if isinstance(history, list) and history:
+            last_entry = history[-1]
+            if isinstance(last_entry, dict):
+                payload = last_entry.get("content")
+            else:
+                payload = last_entry
+
     if isinstance(payload, dict):
         return payload
     if isinstance(payload, list):
@@ -65,13 +137,24 @@ def _attempt_parse_json(payload: Any) -> Any:
         payload = "\n".join(text_parts).strip()
     if not isinstance(payload, str) or not payload.strip():
         return None
+    text_payload = payload.strip()
+    if text_payload.startswith("```"):
+        for segment in text_payload.split("```"):
+            candidate = segment.strip()
+            if not candidate or candidate.lower() in {"json", "javascript"}:
+                continue
+            if candidate.startswith("{") or candidate.startswith("["):
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    continue
     try:
-        return json.loads(payload)
+        return json.loads(text_payload)
     except json.JSONDecodeError:
         try:
             from json_repair import repair_json  # type: ignore
 
-            repaired = repair_json(payload)
+            repaired = repair_json(text_payload)
             return json.loads(repaired)
         except Exception:
             return None
@@ -92,24 +175,89 @@ def _load_autogen_classes() -> Tuple[Any, Any]:
 def _select_next_agent(last_speaker: Any, groupchat: Any) -> Any:
     """Custom speaker selector honoring the `details.next_agent` hint."""
 
-    if groupchat.messages:
-        last_message = groupchat.messages[-1]
+    last_speaker_name = getattr(last_speaker, "name", None)
+    logger.debug("选择下一代理触发，last_speaker=%s", last_speaker_name)
+
+    last_message = groupchat.messages[-1] if groupchat.messages else None
+    parsed: Any = None
+
+    if last_message is not None:
         payload = last_message.get("content") if isinstance(last_message, dict) else None
+        logger.info(
+            "最近消息解析：sender=%s payload_type=%s",
+            getattr(last_speaker, "name", None),
+            type(payload).__name__ if payload is not None else "None",
+        )
         parsed = _attempt_parse_json(payload)
+        logger.info("最近消息JSON解析类型：%s", type(parsed).__name__ if parsed is not None else "None")
         if isinstance(parsed, dict):
             details = parsed.get("details")
             if isinstance(details, dict):
                 next_name = details.get("next_agent")
-                if isinstance(next_name, str):
-                    for agent in groupchat.agents:
-                        if agent.name == next_name:
-                            return agent
+                if isinstance(next_name, str) and next_name:
+                    candidate = _resolve_agent(next_name, groupchat.agents)
+                    if candidate is None:
+                        logger.warning("未找到下一代理：%s", next_name)
+                    elif next_name == last_speaker_name and next_name not in SELF_HANDOFF_ALLOWED:
+                        logger.warning("代理 %s 尝试自我交接，已忽略", next_name)
+                    else:
+                        _patch_next_agent_hint(last_message, candidate.name)
 
-    if not groupchat.messages or (hasattr(last_speaker, "name") and last_speaker.name == "HeadTraderAgent"):
-        for agent in groupchat.agents:
-            if agent.name == "DataAgent":
-                return agent
+    if not groupchat.messages:
+        first_primary = PRIMARY_AGENT_SEQUENCE[0] if PRIMARY_AGENT_SEQUENCE else None
+        first_agent = _resolve_agent(first_primary, groupchat.agents) if first_primary else None
+        if first_agent is not None:
+            logger.debug("初始代理：%s", first_agent.name)
+            return first_agent
+        return "auto"
 
+    if last_speaker_name and last_speaker_name != SCRIBE_AGENT_NAME:
+        if last_speaker_name in PRIMARY_AGENT_SEQUENCE:
+            scribe = _resolve_agent(SCRIBE_AGENT_NAME, groupchat.agents)
+            if scribe is not None:
+                logger.info("路由至书记官，来源代理：%s", last_speaker_name)
+                return scribe
+        else:
+            logger.debug("当前代理 %s 不在预设顺序，尝试默认回退", last_speaker_name)
+
+    if last_speaker_name == SCRIBE_AGENT_NAME:
+        source_agent: str | None = None
+        if isinstance(parsed, dict):
+            details = parsed.get("details")
+            if isinstance(details, dict):
+                source_agent = details.get("source_agent")
+        next_primary = None
+        if isinstance(parsed, dict):
+            details = parsed.get("details")
+            if isinstance(details, dict):
+                hinted_next = details.get("next_agent")
+                logger.info("书记官解析到提示下一代理：%s", hinted_next)
+                if isinstance(hinted_next, str) and hinted_next:
+                    candidate = _resolve_agent(hinted_next, groupchat.agents)
+                    if candidate is not None:
+                        logger.info("书记官遵循提示路由至：%s", candidate.name)
+                        return candidate
+                    logger.warning("提示的下一代理未找到：%s", hinted_next)
+        next_primary = _get_next_primary_after(source_agent)
+        if next_primary:
+            candidate = _resolve_agent(next_primary, groupchat.agents)
+            if candidate is not None:
+                logger.info("书记官按预设顺序路由至：%s", candidate.name)
+                if last_message is not None:
+                    _patch_next_agent_hint(last_message, getattr(candidate, "name", ""))
+                return candidate
+        logger.info("书记官未找到路由提示，使用自动模式")
+        return "auto"
+
+    head_trader = _resolve_agent("HeadTraderAgent", groupchat.agents)
+    if head_trader is not None and head_trader is not last_speaker:
+        if last_message is not None:
+            _patch_next_agent_hint(last_message, head_trader.name)
+        logger.info("回退至主交易员：%s", head_trader.name)
+        return head_trader
+
+    logger.debug("默认自动模式处理下一代理")
+    logger.info("默认自动模式处理下一代理")
     return "auto"
 
 
@@ -232,6 +380,7 @@ def _instantiate_group(settings: Settings) -> Tuple[Any, Any, Any]:
     compliance_agent = create_compliance_agent(settings)
     strategy_agent = create_strategy_agent(settings)
     settlement_agent = create_settlement_agent(settings)
+    scribe_agent = create_scribe_agent(settings)
     tools_proxy = create_user_proxy("ToolsProxy", code_execution_config={"use_docker": False})
 
     GroupChat, GroupChatManager = _load_autogen_classes()
@@ -247,9 +396,11 @@ def _instantiate_group(settings: Settings) -> Tuple[Any, Any, Any]:
             compliance_agent,
             strategy_agent,
             settlement_agent,
+            scribe_agent,
             tools_proxy,
         ],
         messages=[],
+        max_round=settings.workflow_max_rounds,
         speaker_selection_method=_select_next_agent,
         allow_repeat_speaker=False,
     )
@@ -325,9 +476,12 @@ def run_gold_outlook(symbol: str, days: int, *, settings: Settings | None = None
         kickoff_message = base_message
         if format_error:
             kickoff_message += (
-                "\n\nFORMAT CORRECTION: Previous output failed validation because "
-                f"{format_error}. Regenerate the entire workflow output strictly as valid JSON matching "
-                "the required schema (phase, status, summary, details)."
+                "\n\nFORMAT CORRECTION: Previous attempt failed validation because "
+                f"{format_error}. Run the full multi-agent workflow again following the phase sequence. "
+                "Each agent must continue providing its phase-specific JSON (with next_agent hints) without "
+                "trying to produce the final consolidated report prematurely. The final deliverable "
+                "produced after Phase 5 must be valid JSON containing the required fields (phase, status, "
+                "summary, details)."
             )
 
         final_response = head_trader.initiate_chat(manager, message=kickoff_message)
@@ -339,6 +493,13 @@ def run_gold_outlook(symbol: str, days: int, *, settings: Settings | None = None
             break
 
         format_error = error or "unknown validation error"
+        logger.error(
+            "最终响应校验失败：type=%s parsed_type=%s error=%s raw=%r",
+            type(final_response).__name__,
+            type(candidate).__name__ if candidate is not None else "None",
+            format_error,
+            final_response,
+        )
         attempt += 1
         last_groupchat = groupchat
         if attempt >= max_attempts:

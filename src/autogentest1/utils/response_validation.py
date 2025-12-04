@@ -31,9 +31,13 @@ def validate_workflow_response(payload: Any) -> Tuple[bool, str | None]:
     """
 
     try:
-        WorkflowResponseModel.model_validate(payload)
+        model = WorkflowResponseModel.model_validate(payload)
     except ValidationError as exc:
         return False, exc.errors(include_context=False, include_url=False).__repr__()
     except Exception as exc:  # pragma: no cover - defensive
         return False, str(exc)
+    if model.status != "COMPLETE":
+        return False, f"Expected final status 'COMPLETE' but received '{model.status}'"
+    if "Phase 5" not in model.phase:
+        return False, f"Expected final phase to reference 'Phase 5' but received '{model.phase}'"
     return True, None

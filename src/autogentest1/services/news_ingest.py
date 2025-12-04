@@ -9,6 +9,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+import httpx
+
 try:  # pragma: no cover - optional dependency used when available
     import feedparser  # type: ignore
 except ModuleNotFoundError:  # pragma: no cover
@@ -264,13 +266,27 @@ def _fetch_newsapi_articles(news_api_key: Optional[str], query: str, page_size: 
         return []
 
 
+def _download_feed(url: str) -> bytes:
+    try:  # pragma: no cover - network path
+        with httpx.Client(timeout=10.0, follow_redirects=True) as client:
+            response = client.get(url, headers={"User-Agent": "autogentest1/1.0"})
+            response.raise_for_status()
+            return response.content
+    except Exception as exc:  # pragma: no cover
+        logger.warning("Failed to download RSS feed %s: %s", url, exc)
+        return b""
+
+
 def _fetch_rss_articles() -> List[NewsArticle]:
     if feedparser is None:
         return []
     items: List[NewsArticle] = []
     for config in _RSS_SOURCES:
         try:  # pragma: no cover - network path
-            feed = feedparser.parse(config["url"])
+            payload = _download_feed(config["url"])
+            if not payload:
+                continue
+            feed = feedparser.parse(payload)
         except Exception as exc:  # pragma: no cover
             logger.warning("Failed to parse RSS feed %s: %s", config["id"], exc)
             continue
