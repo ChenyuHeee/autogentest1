@@ -22,13 +22,10 @@ def test_local_model_defaults_loaded_from_env(monkeypatch) -> None:
     settings = Settings(
         deepseek_api_key="test-key",
     )
-    assert settings.local_model_enabled is True
-    assert settings.local_model_agents == [
-        "DataAgent",
-        "MacroAnalystAgent",
-        "FundamentalAnalystAgent",
-        "QuantResearchAgent",
-    ]
+    # Default value for local_model_enabled is False (disabled by default)
+    assert settings.local_model_enabled is False
+    # Default value for local_model_agents is empty list (no agents use local model by default)
+    assert settings.local_model_agents == []
 
 
 def test_code_execution_agents_default(monkeypatch) -> None:

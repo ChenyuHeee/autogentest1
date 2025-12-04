@@ -1,9 +1,10 @@
 Metadata-Version: 2.4
 Name: autogentest1
-Version: 0.1.0
+Version: 0.2.0
 Summary: Multi-agent AutoGen workflow for gold trading analytics powered by DeepSeek.
 Requires-Python: >=3.10
 Description-Content-Type: text/markdown
+License-File: LICENSE
 Requires-Dist: pyautogen>=0.2.1
 Requires-Dist: pandas>=2.0
 Requires-Dist: numpy>=1.26
@@ -20,118 +21,164 @@ Requires-Dist: chromadb>=0.5
 Provides-Extra: dev
 Requires-Dist: pytest>=7.4; extra == "dev"
 Requires-Dist: pytest-asyncio>=0.21; extra == "dev"
+Dynamic: license-file
 
 # AutoGen DeepSeek 黄金分析
 
-该项目搭建了一个以黄金交易分析为核心的多智能体 AutoGen 应用。智能体编制参考专业交易团队，覆盖研究、交易、风控与结算等环节，并统一由 DeepSeek 大语言模型驱动。
+面向黄金交易场景的多智能体 AutoGen 工作流，模拟真实的研究→交易→风控→结算链路。系统挖掘宏观/技术/量化信号、执行策略推演，并通过硬风控闸门确保输出符合限额、止损与监管要求。
 
-## 功能特性
-- 采用 AutoGen Assistant 与 UserProxy 角色的智能体架构。
-- 代理角色对标真实交易台，涵盖宏观、基本面、量化、交易、风控、合规与运营职能。
-- 模块化服务层支持行情获取、技术指标、供需洞察与风险快照。
-- 基于 Pydantic 的配置管理，支持 `.env` 环境变量。
-- 提供 CLI 入口以编排黄金展望工作流。
-- 预置测试骨架，便于扩展关键数据处理逻辑。
-- 所有上下文数据与代理回复均约定为 JSON 结构，便于解析与留痕。
-- Risk/Compliance 设有回退闭环，可否决并强制 HeadTrader 与 PaperTrader 重新规划。
-- SettlementAgent 会调用工具更新本地 `portfolio_state`，形成日度记忆。
-- Quant 与 Tech 角色具备内置 Python 代码执行沙盒，自动运行计算脚本并引用结果。
-- 市场数据接入采用适配器模式，可在 `yfinance`、IBKR 等供应商间切换并校验实时性。
-- 行情服务集成 `requests-cache`、指数退避重试与 Mock 回退（通过 `DATA_MODE` 控制），缓解限流导致的失败。
-- Workflow 输出启用 Pydantic 严格校验，失败时自动重试并捕获格式错误。
-- 风控分歧支持最大重试阈值与人工仲裁接口，必要时由 AdminUserProxy 介入。
-- 新增 NewsWatcher 事件驱动服务，可在突发新闻触发风险快审（`--watch-news`）。
+## TL;DR（给同事的速览）
+- **多智能体流程**：Data→Phase1 研究→HeadTrader 定调→纸面交易→Risk/Compliance 审核→Settlement 收尾，全程 JSON 结构化，支持重试与拒单回炉。
+- **统一行情入口**：`services.market_data.fetch_price_history` 将 TwelveData / Polygon / YFinance 等供应商装入适配器，并实现缓存、降级、Mock 回退。
+- **风控硬闸**：`services.risk_gate.evaluate_plan` 在 CLI 层强制执行仓位利用率、单笔敞口、止损覆盖、压力损失、当日回撤、相关性等指标，一旦违规即抛出 `HardRiskBreachError`。
+- **知识检索**：RAG 服务基于 Chroma（本地持久化），通过 `scripts/ingest_macro_history.py` 管理宏观案例 / 交易剧本，并在 ToolsProxy 中暴露查询接口。
+- **扩展性**：Pydantic Settings 驱动 `.env` 配置；工具层已有套利、组合、合规辅助模块；README 末尾列出所有启动命令与关键参数。
 
-## 日常沟通节奏
-工作流遵循真实交易台的晨会流程，确保信息逐级传递与责任明确：
-1. **Phase 1 研究简报**：Data/Macro/Fundamental/Quant 依次输出市场要点并标记完成；
-2. **Phase 2 交易总监定调**：HeadTrader 整合观点，制定基准与备选方案；
-3. **Phase 3 执行方案**：PaperTrader 将策略落地为订单、对冲与监控指令；
-4. **Phase 4 风控合规**：RiskManager 校验风险敞口，Compliance 确认监管与流程；
-5. **Phase 5 运营交接**：Settlement 汇总资金、保证金、物流与未决事项。
-每个阶段收尾需明确标记 `COMPLETE`，以便下一角色接续，最终生成可执行的交易与运营包。
-同时，所有代理的回复需遵循上下文中的 JSON schema（字段包含 phase/status/summary/details），确保易于解析与留痕。
+## 系统总览
+智能体全部基于 DeepSeek（可选本地模型）运行，Supervisor 与 ToolsProxy 将计算、行情、检索等需求统一调度。
 
-## 数据工具
-- `autogentest1.tools.data_tools`：
-   - `get_gold_market_snapshot`：行情、指标与波动率快照。
-   - `get_macro_snapshot`：DXY、TIPS 等宏观代理数据。
-   - `get_gold_silver_ratio`：计算金银比序列。
-   - `get_event_calendar`：占位财经日历，可替换为真实服务。
-- `autogentest1.tools.rag`：
-   - `RagService` 基于 Chroma 的持久向量库，默认索引 `data/rag/macro_history` 与 `data/rag/trading_playbook`。
-   - `scripts/ingest_macro_history.py` 可一次性加载宏观案例与交易剧本，生成本地 `data/rag-index` 索引以供代理检索。
-- `autogentest1.tools.portfolio`：
-   - `get_portfolio_state` / `update_portfolio_state`：读取与写回持仓，SettlementAgent 通过 ToolsProxy 调用。
-- `autogentest1.tools.quant_helpers`：
-   - `prepare_quant_dataset`：一次性输出收盘价、收益、波动率、均线、RSI/ATR 等指标，便于 Quant/Tech 直接引用。
-   - `compute_factor_exposures`：对常见宏观因子（美元、股指、长债）估算相关系数与贝塔，快速识别组合敏感度。
-请在工具调用时返回的 JSON 中记录来源，方便其他角色复核。
+```mermaid
+flowchart LR
+    subgraph Phase1[Phase 1 - Research]
+        DataAgent --> TechAnalystAgent
+        TechAnalystAgent --> MacroAnalystAgent
+        MacroAnalystAgent --> FundamentalAnalystAgent
+        FundamentalAnalystAgent --> QuantResearchAgent
+    end
+    Phase1 --> HeadTraderAgent
+    HeadTraderAgent --> PaperTraderAgent
+    PaperTraderAgent --> RiskManagerAgent
+    RiskManagerAgent --> ComplianceAgent
+    ComplianceAgent --> SettlementAgent
+    ToolsProxy -.-> DataProviders[(Market Data Adapter)]
+    ToolsProxy -.-> QuantHelpers[(Quant Helpers)]
+    ToolsProxy -.-> RagService[(RAG Index)]
+    RiskManagerAgent -->|HardRiskBreach| HeadTraderAgent
+```
 
-## 人设与闭环
-每个 Agent 在 `system_prompt` 中均埋入鲜明的角色定位：
-- 宏观：学院派，重视美元与实际利率。
-- 技术：价格行动猎手，强调点位。
-- 基本面：供需侦探，关注央行、ETF、金银比。
-- 量化：概率与模型首位。
-- 风控：悲观守门员，可直接拒绝计划。
-- 合规：流程铁律，缺一不可。
-- HeadTrader/PaperTrader/Settlement：负责折中、执行与落地。
-当 RiskManager 或 Compliance 设定 `status='REJECTED'/'BLOCKED'` 时，HeadTrader 会按 `feedback_rules` 重开 Phase 2，直到通过。
+> 所有代理输出都必须符合约定 JSON Schema（包含 `phase/status/summary/details`），Scribe 会在出现 `REJECTED/BLOCKED` 时自动回溯到 HeadTrader。
 
-## 本地模型集成
-- 适配示例：MacBook M4 24G 可运行 Qwen2.5-14B-Instruct（量化后约 9–10GB）。
-- 启动步骤：安装 `ollama` 或 `llama.cpp` 推理服务 → 拉取模型 → 启动本地 HTTP 接口（默认 `http://127.0.0.1:11434/v1`）。
-- 配置方式：在 `.env` 中设置 `LOCAL_MODEL_ENABLED=true`，填写 `LOCAL_MODEL_NAME`（示例：`qwen2.5:14b-instruct-q4_K_M`）、`LOCAL_MODEL_BASE_URL`、`LOCAL_MODEL_AGENTS`（如 `DataAgent,MacroAnalystAgent,QuantResearchAgent`）。
-- 运行逻辑：被列入 `LOCAL_MODEL_AGENTS` 的角色优先调用本地模型，失败时自动回退至 DeepSeek；其余角色仍直接使用 DeepSeek。
-- 建议分工：让 Phase 1 的研究角色、Phase 4 风控初审等高频任务落在本地模型，关键决策仍交由云端模型兜底。
+## 核心角色与算法思路
 
-## 智能体编制
-- **HeadTraderAgent**：整合所有研究观点并定稿交易计划。
-- **DataAgent**：获取市场行情、成交量与波动率上下文。
-- **TechAnalystAgent**：解析技术指标与价格结构。
-- **MacroAnalystAgent**：评估宏观政策、美元流动性与地缘政治因素。
-- **FundamentalAnalystAgent**：跟踪央行购金、ETF 流、实物溢价与季节性需求。
-- **QuantResearchAgent**：基于历史数据和量化模型评估信号强度与场景。
-- **PaperTraderAgent**：将观点落实为可执行的期货/OTC 策略。
-- **RiskManagerAgent**：校验仓位与 PnL 是否符合风控阈值并提出对冲方案；风控工具现已输出组合 VaR（百万美元）、跨资产滚动相关系数以及情景压力测试 PnL，便于快速识别限额占用与极端亏损风险。
-- **ComplianceAgent**：确认合规、审批与留痕要求。
-- **SettlementAgent**：输出资金、保证金、交割与物流的清单。
-- **ToolsProxy**：在需要时调用 Python 工具函数以支撑数据请求。
+### 研究 & 交易链路
+- **DataAgent**：汇聚实时报价、成交量、波动率，确保后续角色引用的数据源一致。
+- **TechAnalystAgent**：先评估 D1 趋势，再聚焦 H4 触发区间，明确关键价位、交易区间与风险位。
+- **MacroAnalystAgent**：围绕实际利率、美元流动性、政策窗口构建主/备叙事，并评估与技术触发共振程度。
+- **FundamentalAnalystAgent**：覆盖央行购金、ETF 流、实物溢价，补充需求/供给视角。
+- **QuantResearchAgent**：调用沙盒脚本生成信号值、预期收益、风险回报与压力测试，并输出 D1 vs H4 的信号一致性。
+- **HeadTraderAgent**：整合上游观点，制定基准与对冲方案。
+- **PaperTraderAgent**：转换为订单、仓位调节、对冲计划，并准备交给风控。
 
-## 快速开始
-1. 创建并激活 Python 3.10 及以上版本的环境。
-2. 安装依赖：
-   ```bash
-   pip install .
-   ```
-3. 复制 `.env.example` 为 `.env`，并填写 DeepSeek API Key、数据源等凭证。
-4. 运行主工作流：
-   ```bash
-   python -m autogentest1.main --days 14 --symbol XAUUSD
-   ```
-5. 启动事件监听（可选）：
-   ```bash
-   python -m autogentest1.main --watch-news
-   ```
+### 风控与合规闭环
+- **RiskManagerAgent**：加载最新 `risk_snapshot` 与策略计划，执行硬闸算法（见下）。
+- **ComplianceAgent**：验证合规规则、文档、交易对手与审批链；如 RiskManager 的 `revision_actions` 未清理，会保持 `BLOCKED`。
+- **SettlementAgent**：同步资金、保证金、交割事项，并更新 `portfolio_state`。
 
-关键环境变量（`.env`）：
+## 行情数据与算法路线
+### Market Data Router
+统一由 `services.market_data.fetch_price_history` 执行：
+1. 根据请求的 symbol / interval 查询 Settings 中的 symbol map（TwelveData、Polygon 预置映射：`XAUUSD`→`XAU/USD`、`C:XAUUSD` 等）。
+2. 尝试实时供应商（TwelveData、Polygon 等），使用 `requests-cache`、指数退避、UTC 时间戳归一化。
+3. 回退至次级供应商（YFinance、AlphaVantage、Tanshu、Mock 数据），确保在缺口时也有序列可用。
+4. 所有结果均由 `_ensure_freshness` 校验时间戳（默认 1440 分钟内有效），否则触发降级。
 
+### 工具层集合
+- `autogentest1.tools.data_tools`
+  - `get_gold_market_snapshot` / `get_macro_snapshot` / `get_gold_silver_ratio` / `get_event_calendar`
+  - 所有调用都回归 `fetch_price_history`，避免直连 YFinance。
+- `autogentest1.tools.quant_helpers`
+  - `prepare_quant_dataset`（收益、波动率、均线、RSI、ATR 等）
+  - `compute_factor_exposures`（美元、股指、长债等因子暴露）
+- `autogentest1.tools.portfolio`
+  - 读取/更新本地组合快照，供 Settlement 维持日度记忆。
+- `autogentest1.tools.rag`
+  - `RagService`（Chroma 持久库） + `rag_tools.query_playbook`
+  - `scripts/ingest_macro_history.py` 支持 `--namespace`、`--tag`、`--log-dir`，并写入 `outputs/ingest_logs/ingest_*.json`。
+
+> 工具调用返回的 JSON 需包含 `source` 字段，便于审计引用来源。
+
+## 风控硬闸算法（Risk Gate）
+硬闸位于 `services.risk_gate.evaluate_plan`：
+1. **输入**：纸面交易方案 JSON + 最新 `risk_snapshot`。
+2. **阈值**：取自 `config.settings.Settings` 中的 `hard_gate_*` 配置，可用 `.env` 覆写。
+3. **检查项**：
+   - 仓位利用率 ≤ `hard_gate_max_position_utilization`
+   - 单笔敞口 ≤ `hard_gate_max_single_order_oz`
+   - 止损必须存在（`hard_gate_require_stop_loss`）
+   - 压力情景损失 ≤ `hard_gate_max_stress_loss_millions`
+   - 当日回撤 ≤ `daily_drawdown_pct`
+   - 相关性阈值（组合过度集中）
+4. **结果处理**：
+   - 全部通过：返回 `RiskGateReport`，工作流继续。
+   - 任意失败：抛出 `HardRiskBreachError`，CLI 将 `breaches` 写入磁盘并通知 Risk/HeadTrader 回炉（详见 `docs/workflows/risk_gate_flow.md`）。
+
+## RAG 知识体系
+- 向量库路径：默认 `data/rag-index`，命名空间 `gold-playbooks`。
+- 语料：`data/rag/macro_history`（宏观事件）、`data/rag/trading_playbook`（交易剧本）。
+- 脚本：
+  ```bash
+  python scripts/ingest_macro_history.py --log-dir outputs/ingest_logs
+  ```
+  支持 `--namespace gold-playbooks --tag macro crisis` 等参数，并生成 JSON 摘要。
+- 工具调用：`rag_tools.query_playbook(question="mean reversion in gold")`。
+- 测试覆盖：`tests/test_rag.py` 确保 ingest / 查询 / 回退机制。
+
+## 市场数据供应商清单
+- IBKR：申请 Metals、FX 数据订阅，启用 IB Gateway/API（详见 `docs/requirements/market_data_subscription_plan.md`）。
+- Polygon.io：升级计划以获取 `Currencies`、`Indices`、`Commodities`；保存 `POLYGON_API_KEY`。
+- FRED：免费注册获取 `FRED_API_KEY`，提供美元指数、TIPS 等宏观序列。
+- TradingEconomics：确认配额，申请 `Client Key/Secret`，支持黄金、国债、通胀系列。
+- TwelveData：可选扩展，即时行情；通过 Settings 的 `twelve_data_symbol_map` 覆写。
+
+所有凭证放入 `.env`：
 ```
 DEEPSEEK_API_KEY=...
-DEEPSEEK_MODEL=deepseek-chat
-DATA_MODE=hybrid
-MAX_POSITION_OZ=5000
-STRESS_VAR_MILLIONS=3.0
-DAILY_DRAWDOWN_PCT=3.0
-DEFAULT_POSITION_OZ=1200
-PNL_TODAY_MILLIONS=0.4
-MARKET_DATA_MAX_AGE_MINUTES=1440
-MARKET_DATA_CACHE_MINUTES=10
-MARKET_DATA_RETRY_TOTAL=4
-MARKET_DATA_RETRY_BACKOFF=1.0
+POLYGON_API_KEY=...
+FRED_API_KEY=...
+TRADING_ECONOMICS_CLIENT=...
+TRADING_ECONOMICS_SECRET=...
+LOCAL_MODEL_ENABLED=false
+LOCAL_MODEL_NAME=qwen2.5-14b-instruct
+LOCAL_MODEL_AGENTS=DataAgent,MacroAnalystAgent,QuantResearchAgent
 ```
 
-## 开发说明
-- 使用 `pytest` 运行 `tests/` 目录下的测试。
-- 根据自身投资假设或专有数据源扩展智能体提示词与服务模块。
+## 本地模型与未来扩展
+- 支持通过 `LOCAL_MODEL_ENABLED` 将 Phase1 高频角色落到本地（例如 Qwen2.5-14B Instruct），其余仍回退 DeepSeek。
+- `docs/workflows/arbitrage_agent_plan.md` 描述了金银比套利 Agent 的原型，后续版本可启用。
+
+## 快速开始与运维
+```bash
+# 1. 安装依赖
+pip install .
+
+# 2. 拷贝环境变量模板并填充
+cp .env.example .env
+
+# 3. 运行主工作流（示例：回看 14 天，XAUUSD）
+python -m autogentest1.main --days 14 --symbol XAUUSD
+
+# 4. 开启新闻监听（可选）
+python -m autogentest1.main --watch-news
+
+# 5. 构建 RAG 索引并记录日志
+python scripts/ingest_macro_history.py --log-dir outputs/ingest_logs
+
+# 6. 执行全量测试
+pytest
+```
+
+## 文档索引
+- 风控闸门回路：`docs/workflows/risk_gate_flow.md`
+- ArbitrageAgent 规划：`docs/workflows/arbitrage_agent_plan.md`
+- 行情供应商清单：`docs/requirements/market_data_subscription_plan.md`
+- RAG 素材 backlog：`docs/requirements/rag_corpus_backlog.md`
+- 最新发布说明：`docs/releases/2025-12-04.md`
+
+## 开发与测试
+- 运行 `pytest`（42 项）验证行情、风控、RAG 等模块。
+- 新增功能需确保：
+  1. 工具层遵循统一行情接口；
+  2. 输出遵循 JSON Schema；
+  3. 更新 `.env` 配置文档与相应测试。
+
+> 当前版本 `v0.2.0` 已通过 full test suite，详见 release notes。欢迎在 `mtr/12.4/2025-12-04-technical-prep.md` 查看每日技术准备记录。
