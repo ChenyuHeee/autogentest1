@@ -35,7 +35,11 @@ from ..services.state import load_portfolio_state, update_portfolio_state
 from ..utils.logging import configure_logging, get_logger
 from ..utils.plotting import plot_price_history
 from ..utils.response_validation import validate_workflow_response
-from autogen.exception_utils import NoEligibleSpeakerError
+
+try:  # pragma: no cover - dependency API drift between autogen releases
+    from autogen.exception_utils import NoEligibleSpeakerError  # type: ignore[attr-defined]
+except (ImportError, AttributeError):  # pragma: no cover - back-compat path
+    from autogen.exception_utils import NoEligibleSpeaker as NoEligibleSpeakerError  # type: ignore
 
 logger = get_logger(__name__)
 
@@ -366,6 +370,9 @@ def build_conversation_context(symbol: str, days: int, settings: Settings) -> Tu
         ),
         current_position_oz=settings.default_position_oz,
         pnl_today_millions=settings.pnl_today_millions,
+        max_data_age_minutes=settings.market_data_max_age_minutes,
+        data_provider=settings.data_provider,
+        data_mode=settings.data_mode,
     )
 
     settlement_tasks = build_settlement_checklist(symbol)

@@ -52,6 +52,8 @@ class Settings(BaseSettings):
     default_symbol: str = Field("XAUUSD")
     default_days: int = Field(14)
     log_level: str = Field("INFO")
+    audit_log_enabled: bool = Field(True)
+    audit_log_directory: str = Field(default_factory=lambda: str(Path.home() / ".autogentest1" / "audit"))
     max_position_oz: float = Field(5000.0)
     stress_var_millions: float = Field(3.0)
     daily_drawdown_pct: float = Field(3.0)
@@ -60,19 +62,40 @@ class Settings(BaseSettings):
     hard_gate_enabled: bool = Field(True)
     hard_gate_fail_fast: bool = Field(True)
     hard_gate_max_position_utilization: float | None = Field(1.0)
-    hard_gate_max_single_order_oz: float | None = Field(None)
+    hard_gate_max_position_utilization_routine: float = Field(0.6)
+    hard_gate_max_position_utilization_elevated: float = Field(0.8)
+    hard_gate_max_position_utilization_hard_limit: float = Field(0.95)
+    hard_gate_incremental_position_utilization_limit: float = Field(0.3)
+    hard_gate_max_single_order_oz: float | None = Field(2000.0)
     hard_gate_max_stress_loss_millions: float | None = Field(None)
+    hard_gate_stress_loss_warning_millions: float | None = Field(1.5)
+    hard_gate_stress_loss_circuit_breaker_millions: float | None = Field(5.0)
     hard_gate_correlation_threshold: float | None = Field(0.9)
+    hard_gate_correlation_warning_threshold: float | None = Field(0.6)
+    hard_gate_correlation_limit_threshold: float | None = Field(0.8)
+    hard_gate_correlation_block_threshold: float | None = Field(0.95)
     hard_gate_require_stop_loss: bool = Field(True)
-    hard_gate_min_stop_distance_pct: float = Field(0.1)
+    hard_gate_min_stop_distance_pct: float = Field(0.5)
     hard_gate_max_stop_distance_pct: float = Field(3.0)
     hard_gate_stop_coverage_ratio: float = Field(1.0)
-    hard_gate_min_liquidity_depth_oz: float | None = Field(1500.0)
+    hard_gate_stop_coverage_exemptions: List[str] = Field(default_factory=list)
+    hard_gate_min_liquidity_depth_oz: float | None = Field(800.0)
     hard_gate_depth_buffer_ratio: float = Field(1.2)
-    hard_gate_max_spread_bps: float = Field(25.0)
+    hard_gate_max_spread_bps: float = Field(40.0)
     hard_gate_max_slippage_bps: float = Field(35.0)
     hard_gate_liquidity_baseline_oz: float = Field(1000.0)
     hard_gate_depth_volume_ratio: float = Field(0.05)
+    hard_gate_liquidity_session_relaxation: Dict[str, float] = Field(
+        default_factory=lambda: {
+            "asia": 1.5,
+            "london": 1.2,
+            "newyork": 1.0,
+            "off_hours": 1.3,
+        }
+    )
+    hard_gate_target_stop_min_ratio: float | None = Field(None)
+    hard_gate_allow_trailing_stop_override: bool = Field(True)
+    hard_gate_allow_technical_stop_override: bool = Field(True)
     compliance_allowed_instruments: List[str] = Field(
         default_factory=lambda: ["XAUUSD", "GC", "GC=F", "GLD"]
     )
@@ -100,7 +123,7 @@ class Settings(BaseSettings):
     workflow_format_retry_limit: int = Field(2)
     workflow_max_rounds: int = Field(30)
     workflow_max_plan_retries: int = Field(3)
-    market_data_max_age_minutes: int = Field(1440)
+    market_data_max_age_minutes: int = Field(30)
     human_override_timeout_seconds: int = Field(120)
     market_data_cache_minutes: int = Field(10)
     market_data_retry_total: int = Field(4)
@@ -109,6 +132,11 @@ class Settings(BaseSettings):
     news_watcher_poll_seconds: int = Field(300)
     news_watcher_keywords: List[str] = Field(default_factory=lambda: ["war", "fed", "cpi", "rate", "hike"])
     news_watcher_vol_threshold: float = Field(0.4)
+    circuit_breaker_enabled: bool = Field(False)
+    circuit_breaker_max_consecutive_losses: int = Field(5)
+    circuit_breaker_daily_loss_limit_millions: float = Field(2.0)
+    circuit_breaker_vol_spike_multiple: float = Field(3.0)
+    circuit_breaker_cooldown_minutes: int = Field(60)
     alpha_vantage_api_key: str | None = Field(
         None,
         validation_alias=AliasChoices("alpha_vantage_api_key", "alphavantage_api_key", "ALPHAVANTAGE_API_KEY"),
@@ -172,6 +200,7 @@ class Settings(BaseSettings):
         "compliance_restricted_instruments",
         "compliance_allowed_counterparties",
         "compliance_restricted_counterparties",
+        "hard_gate_stop_coverage_exemptions",
         mode="before",
     )
     @classmethod
@@ -221,6 +250,47 @@ class Settings(BaseSettings):
                 return mapping
         return {}
 
+    @field_validator("hard_gate_liquidity_session_relaxation", mode="before")
+    @classmethod
+    def _parse_session_relaxation(cls, value: object) -> Dict[str, float]:
+        if value is None:
+            return {}
+        if isinstance(value, dict):
+            parsed: Dict[str, float] = {}
+            for key, raw in value.items():
+                if key is None or raw is None:
+                    continue
+                try:
+                    parsed[str(key).lower()] = float(raw)
+                except (TypeError, ValueError):
+                    continue
+            return parsed
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if not cleaned:
+                return {}
+            try:
+                decoded = json.loads(cleaned)
+                if isinstance(decoded, dict):
+                    return cls._parse_session_relaxation(decoded)
+            except json.JSONDecodeError:
+                parsed: Dict[str, float] = {}
+                parts = [segment for segment in cleaned.split(",") if segment.strip()]
+                for part in parts:
+                    if ":" not in part:
+                        continue
+                    key, raw = part.split(":", 1)
+                    key = key.strip()
+                    raw = raw.strip()
+                    if not key or not raw:
+                        continue
+                    try:
+                        parsed[key.lower()] = float(raw)
+                    except ValueError:
+                        continue
+                return parsed
+        return {}
+
     @model_validator(mode="before")
     @classmethod
     def _coerce_numeric_bounds(cls, data: Any) -> Any:
@@ -253,6 +323,20 @@ class Settings(BaseSettings):
             coerced["hard_gate_max_position_utilization"] = max(
                 0.0, float(coerced["hard_gate_max_position_utilization"])
             )
+        for key in (
+            "hard_gate_max_position_utilization_routine",
+            "hard_gate_max_position_utilization_elevated",
+            "hard_gate_max_position_utilization_hard_limit",
+        ):
+            if key in coerced and coerced[key] is not None:
+                coerced[key] = max(0.0, min(1.5, float(coerced[key])))
+        if (
+            "hard_gate_incremental_position_utilization_limit" in coerced
+            and coerced["hard_gate_incremental_position_utilization_limit"] is not None
+        ):
+            coerced["hard_gate_incremental_position_utilization_limit"] = max(
+                0.0, min(1.0, float(coerced["hard_gate_incremental_position_utilization_limit"]))
+            )
         if "hard_gate_max_single_order_oz" in coerced and coerced["hard_gate_max_single_order_oz"] is not None:
             coerced["hard_gate_max_single_order_oz"] = max(
                 0.0, float(coerced["hard_gate_max_single_order_oz"])
@@ -261,10 +345,28 @@ class Settings(BaseSettings):
             coerced["hard_gate_max_stress_loss_millions"] = max(
                 0.0, float(coerced["hard_gate_max_stress_loss_millions"])
             )
+        if "hard_gate_stress_loss_warning_millions" in coerced and coerced["hard_gate_stress_loss_warning_millions"] is not None:
+            coerced["hard_gate_stress_loss_warning_millions"] = max(
+                0.0, float(coerced["hard_gate_stress_loss_warning_millions"])
+            )
+        if (
+            "hard_gate_stress_loss_circuit_breaker_millions" in coerced
+            and coerced["hard_gate_stress_loss_circuit_breaker_millions"] is not None
+        ):
+            coerced["hard_gate_stress_loss_circuit_breaker_millions"] = max(
+                0.0, float(coerced["hard_gate_stress_loss_circuit_breaker_millions"])
+            )
         if "hard_gate_correlation_threshold" in coerced and coerced["hard_gate_correlation_threshold"] is not None:
             coerced["hard_gate_correlation_threshold"] = max(
                 0.0, min(1.0, float(coerced["hard_gate_correlation_threshold"]))
             )
+        for key in (
+            "hard_gate_correlation_warning_threshold",
+            "hard_gate_correlation_limit_threshold",
+            "hard_gate_correlation_block_threshold",
+        ):
+            if key in coerced and coerced[key] is not None:
+                coerced[key] = max(0.0, min(1.0, float(coerced[key])))
         if "hard_gate_min_stop_distance_pct" in coerced:
             coerced["hard_gate_min_stop_distance_pct"] = max(0.0, float(coerced["hard_gate_min_stop_distance_pct"]))
         if "hard_gate_max_stop_distance_pct" in coerced:
@@ -285,6 +387,8 @@ class Settings(BaseSettings):
             coerced["hard_gate_liquidity_baseline_oz"] = max(1.0, float(coerced["hard_gate_liquidity_baseline_oz"]))
         if "hard_gate_depth_volume_ratio" in coerced:
             coerced["hard_gate_depth_volume_ratio"] = max(0.0, min(1.0, float(coerced["hard_gate_depth_volume_ratio"])) )
+        if "hard_gate_target_stop_min_ratio" in coerced and coerced["hard_gate_target_stop_min_ratio"] is not None:
+            coerced["hard_gate_target_stop_min_ratio"] = max(0.0, float(coerced["hard_gate_target_stop_min_ratio"]))
         if "data_mode" in coerced:
             coerced["data_mode"] = str(coerced["data_mode"]).lower()
         if "rag_chunk_size" in coerced:
@@ -295,6 +399,18 @@ class Settings(BaseSettings):
             coerced["rag_chunk_overlap"] = min(overlap, chunk - 1 if chunk > 1 else 0)
         if "rag_similarity_threshold" in coerced:
             coerced["rag_similarity_threshold"] = max(0.0, min(1.0, float(coerced["rag_similarity_threshold"])))
+        if "circuit_breaker_max_consecutive_losses" in coerced:
+            coerced["circuit_breaker_max_consecutive_losses"] = max(1, int(coerced["circuit_breaker_max_consecutive_losses"]))
+        if "circuit_breaker_daily_loss_limit_millions" in coerced:
+            coerced["circuit_breaker_daily_loss_limit_millions"] = max(
+                0.0, float(coerced["circuit_breaker_daily_loss_limit_millions"])
+            )
+        if "circuit_breaker_vol_spike_multiple" in coerced:
+            coerced["circuit_breaker_vol_spike_multiple"] = max(
+                0.0, float(coerced["circuit_breaker_vol_spike_multiple"])
+            )
+        if "circuit_breaker_cooldown_minutes" in coerced:
+            coerced["circuit_breaker_cooldown_minutes"] = max(1, int(coerced["circuit_breaker_cooldown_minutes"]))
         return coerced
 
     @model_validator(mode="before")

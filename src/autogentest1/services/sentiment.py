@@ -28,19 +28,28 @@ _POSITIVE_TOKENS: Dict[str, float] = {
     "haven": 1.1,
     "bull": 1.0,
     "bid": 0.8,
+    "strong": 0.8,
+    "gain": 0.8,
+    "high": 0.6,
+    "cut": 0.5,  # Rate cut is usually bullish for gold
+    "easing": 0.7,
 }
 
 _NEGATIVE_TOKENS: Dict[str, float] = {
     "sell": 1.0,
     "slump": 1.2,
-    "recession": 1.1,
-    "rate": 0.6,
-    "hike": 0.9,
+    "recession": 1.1, # Recession might be bullish (safe haven) or bearish (cash dash), context matters. Keeping as neg for now.
+    "rate": 0.2,      # "Rate" itself is neutral, but often associated with hikes
+    "hike": 1.2,
     "hawkish": 1.0,
-    "risk": 0.7,
-    "fear": 1.0,
+    "risk": 0.5,      # Geopolitical risk is bullish, market risk is bearish. Ambiguous.
+    "fear": 0.5,
     "outflow": 1.1,
-    "cut": 0.4,
+    "pressure": 0.9,
+    "dip": 0.8,
+    "drop": 0.9,
+    "weak": 0.8,
+    "fall": 0.8,
 }
 
 _STOPWORDS: Sequence[str] = (
@@ -144,18 +153,28 @@ def collect_sentiment_snapshot(
     *,
     news_api_key: str | None = None,
     alpha_vantage_api_key: str | None = None,
+    simulation_date: str | None = None,
 ) -> Dict[str, Any]:
-    """Return a sentiment snapshot derived from weighted news headlines."""
+    """Return a sentiment snapshot derived from weighted news headlines.
+
+    Args:
+        symbol: Ticker symbol.
+        news_api_key: Optional API key.
+        alpha_vantage_api_key: Optional API key.
+        simulation_date: If provided (YYYY-MM-DD), fetch historical news for backtesting.
+    """
 
     articles = collect_news_articles(
         symbol,
         news_api_key=news_api_key,
         alpha_vantage_api_key=alpha_vantage_api_key,
+        simulation_date=simulation_date,
     )
 
     if not articles:
-        generated_at = datetime.now(timezone.utc).isoformat()
-        _persist_history(symbol, generated_at, 0.0)
+        generated_at = simulation_date or datetime.now(timezone.utc).isoformat()
+        if not simulation_date:
+            _persist_history(symbol, generated_at, 0.0)
         return {
             "generated_at": generated_at,
             "symbol": symbol,
@@ -197,8 +216,10 @@ def collect_sentiment_snapshot(
     else:
         classification = "neutral"
 
-    generated_at = datetime.now(timezone.utc).isoformat()
-    trend = _compute_trend(symbol, sentiment, generated_at)
+    generated_at = simulation_date or datetime.now(timezone.utc).isoformat()
+    trend = 0.0
+    if not simulation_date:
+        trend = _compute_trend(symbol, sentiment, generated_at)
 
     sorted_by_score = sorted(enriched, key=lambda item: item["score"], reverse=True)
     positive_highlights = sorted_by_score[:3]

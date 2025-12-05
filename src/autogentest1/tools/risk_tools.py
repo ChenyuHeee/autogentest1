@@ -64,4 +64,7 @@ def compute_risk_profile(
         correlation_targets=correlation_targets or DEFAULT_CORRELATION_TARGETS,
         news_snapshot=snapshot,
         apply_news_adjustment=apply_adjustment,
+        max_data_age_minutes=settings.market_data_max_age_minutes,
+        data_provider=settings.data_provider,
+        data_mode=settings.data_mode,
     )

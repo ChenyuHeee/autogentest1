@@ -8,6 +8,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 import numpy as np
 import pandas as pd
 
+from .sentiment import collect_sentiment_snapshot
+
 TRADING_DAYS_PER_YEAR = 252
 
 
@@ -115,26 +117,42 @@ def _collect_trades(
         position = float(positions.iloc[idx])
         if position == prev_position:
             continue
-        price = float(close.iloc[idx])
-        equity_level = float(equity.iloc[idx])
-        ts = pd.Timestamp(timestamp)
+        
+        # When position changes at 'idx', it means the trade was entered/exited
+        # based on the signal from the PREVIOUS bar (idx-1).
+        # So the entry/exit price is the Close of the previous bar.
+        # And the entry/exit equity is the Equity at the end of the previous bar.
+        
+        if idx > 0:
+            trade_date = positions.index[idx-1]
+            trade_price = float(close.iloc[idx-1])
+            trade_equity = float(equity.iloc[idx-1])
+        else:
+            # Edge case: Position starts non-zero at index 0.
+            # We assume entry at start of simulation.
+            trade_date = positions.index[0]
+            trade_price = float(close.iloc[0])
+            trade_equity = float(equity.iloc[0]) # This is initial_capital if returns[0]=0
+
+        ts = pd.Timestamp(trade_date)
+        
         if position > prev_position:  # Enter long
             open_trade = {
                 "entry_date": ts.strftime("%Y-%m-%d"),
-                "entry_price": price,
-                "entry_equity": equity_level,
+                "entry_price": trade_price,
+                "entry_equity": trade_equity,
             }
         elif position < prev_position and open_trade:
             # Exit long position
-            return_pct = (equity_level / open_trade["entry_equity"]) - 1.0
-            pnl = equity_level - open_trade["entry_equity"]
+            return_pct = (trade_equity / open_trade["entry_equity"]) - 1.0
+            pnl = trade_equity - open_trade["entry_equity"]
             trades.append(
                 Trade(
                     entry_date=open_trade["entry_date"],
                     exit_date=ts.strftime("%Y-%m-%d"),
                     direction="long",
                     entry_price=open_trade["entry_price"],
-                    exit_price=price,
+                    exit_price=trade_price,
                     return_pct=float(return_pct),
                     pnl=float(pnl),
                 )
@@ -291,6 +309,45 @@ def _mean_reversion_strategy(
     }
 
 
+def _sentiment_weighted_strategy(
+    close: pd.Series,
+    initial_capital: float,
+    *,
+    symbol: str,
+    threshold: float = 0.1,
+) -> Dict[str, Any]:
+    """Strategy that adjusts position based on historical sentiment scores."""
+    
+    positions = pd.Series(0.0, index=close.index)
+    
+    # Iterate through dates to fetch historical sentiment
+    # Note: This is slow because it calls the sentiment service for each day
+    for timestamp in close.index:
+        date_str = timestamp.strftime("%Y-%m-%d")
+        snapshot = collect_sentiment_snapshot(symbol=symbol, simulation_date=date_str)
+        score = snapshot.get("score", 0.0)
+        
+        if score > threshold:
+            positions.at[timestamp] = 1.0  # Long
+        elif score < -threshold:
+            positions.at[timestamp] = -1.0 # Short
+        else:
+            positions.at[timestamp] = 0.0  # Neutral
+
+    shifted_positions = positions.shift(1).fillna(0.0)
+    returns = close.pct_change().fillna(0.0)
+    strategy_returns = returns * shifted_positions
+    equity = (1.0 + strategy_returns).cumprod() * initial_capital
+    trades = _collect_trades(close, equity, shifted_positions)
+
+    return {
+        "equity": equity,
+        "strategy_returns": strategy_returns,
+        "positions": shifted_positions,
+        "trades": trades,
+    }
+
+
 def _positions_from_signals(index: pd.Index, signals: Sequence[Dict[str, Any]]) -> pd.Series:
     if not signals:
         raise ValueError("signals list cannot be empty for custom strategy")
@@ -382,6 +439,16 @@ def run_backtest(
             "trades": trades,
         }
         params["signals_count"] = len(signal_entries)
+    elif strategy_name == "sentiment_weighted":
+        threshold = float(params.get("threshold", 0.1))
+        symbol = str(params.get("symbol", "XAUUSD"))
+        payload = _sentiment_weighted_strategy(
+            close,
+            initial_capital,
+            symbol=symbol,
+            threshold=threshold,
+        )
+        params["threshold"] = threshold
     else:
         raise ValueError(f"Unsupported strategy '{strategy}'")
 

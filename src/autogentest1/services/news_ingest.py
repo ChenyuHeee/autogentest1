@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 _OUTPUT_DIR = Path(__file__).resolve().parent.parent / "outputs"
 _CACHE_FILE = _OUTPUT_DIR / "news_cache.json"
 _ALPHA_CACHE_FILE = _OUTPUT_DIR / "alpha_news_cache.json"
+_NEWS_ARCHIVE_FILE = Path(__file__).resolve().parent.parent.parent.parent / "data" / "rag" / "news_archive.json"
 _ALPHA_CACHE_TTL = timedelta(hours=4)
 
 _FALLBACK_HEADLINES: Sequence[Dict[str, Any]] = (
@@ -333,14 +334,54 @@ def _save_cache(articles: Iterable[NewsArticle]) -> None:
     except Exception as exc:
         logger.warning("Unable to persist news cache: %s", exc)
 
+
+def _load_historical_news(date_str: str) -> List[NewsArticle]:
+    """Load news from the local archive for a specific date (YYYY-MM-DD)."""
+    if not _NEWS_ARCHIVE_FILE.exists():
+        return []
+    try:
+        with _NEWS_ARCHIVE_FILE.open("r", encoding="utf-8") as handle:
+            archive = json.load(handle)
+    except Exception as exc:
+        logger.warning("Failed to load news archive: %s", exc)
+        return []
+
+    # Try exact match
+    articles_data = archive.get(date_str)
+    if not articles_data:
+        # Fallback: try to find the closest previous date if exact match fails?
+        # For now, strict matching.
+        return []
+
+    articles: List[NewsArticle] = []
+    for item in articles_data:
+        try:
+            articles.append(NewsArticle(**item))
+        except TypeError:
+            continue
+    return articles
+
+
 def collect_news_articles(
     symbol: str,
     *,
     news_api_key: Optional[str] = None,
     alpha_vantage_api_key: Optional[str] = None,
     limit: int = 30,
+    simulation_date: Optional[str] = None,
 ) -> List[NewsArticle]:
-    """Fetch news articles for the given symbol from multiple sources with caching."""
+    """Fetch news articles for the given symbol from multiple sources with caching.
+
+    Args:
+        symbol: Ticker symbol (e.g. XAUUSD).
+        news_api_key: API key for NewsAPI.
+        alpha_vantage_api_key: API key for Alpha Vantage.
+        limit: Max articles to return.
+        simulation_date: If provided (YYYY-MM-DD), fetch from historical archive instead of live APIs.
+    """
+
+    if simulation_date:
+        return _load_historical_news(simulation_date)
 
     candidate_articles: List[NewsArticle] = []
 

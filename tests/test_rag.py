@@ -11,13 +11,11 @@ import pytest
 from autogentest1.config.settings import Settings
 from autogentest1.tools import rag_tools
 from autogentest1.tools.rag import RagConfig, RagDocument, RagService
+from autogentest1.tools.rag import client as rag_client
 
-try:  # pragma: no cover - exercised in environments without chromadb
-    import chromadb  # type: ignore
-except Exception:  # pragma: no cover - skip tests when dependency missing
-    chromadb = None
-
-pytestmark = pytest.mark.skipif(chromadb is None, reason="chromadb not available for tests")
+@pytest.fixture(autouse=True)
+def _force_json_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(rag_client, "chromadb", None)
 
 
 def test_rag_ingest_and_query(tmp_path: Path) -> None:
@@ -141,3 +139,36 @@ def test_rag_tools_auto_ingest_fallback(tmp_path: Path, monkeypatch) -> None:
 
     info = rag_tools.ensure_default_corpus_loaded(settings=settings_obj, force=True)
     assert info["documents"] > 0
+
+
+def test_rag_json_fallback_snapshot(tmp_path: Path) -> None:
+    snapshot = Path(__file__).resolve().parents[1] / "data" / "rag-index" / "default.json"
+    index_root = tmp_path / "index"
+    index_root.mkdir(parents=True)
+    target = index_root / "default.json"
+    target.write_text(snapshot.read_text(encoding="utf-8"), encoding="utf-8")
+
+    service = RagService(RagConfig(index_root=index_root, namespace="default"))
+    assert service.count() > 0
+
+    result = service.query("How did gold behave during the taper tantrum?", top_k=3)
+    assert result.passages
+    assert any("taper" in passage.lower() for passage in result.passages)
+    assert result.ids
+
+
+def test_rag_json_fallback_idempotent_ingest(tmp_path: Path) -> None:
+    service = RagService(RagConfig(index_root=tmp_path, namespace="unit"))
+
+    document = RagDocument(
+        body="Gold rallied sharply when real yields collapsed during the pandemic.",
+        metadata={"source": "unit-test", "year": 2020},
+    )
+
+    first = service.ingest_documents([document, document])
+    assert first == 1
+    baseline = service.count()
+
+    second = service.ingest_documents([document])
+    assert second == 0
+    assert service.count() == baseline

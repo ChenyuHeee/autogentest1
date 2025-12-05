@@ -132,3 +132,36 @@ def test_build_risk_snapshot_alert_flags() -> None:
     assert "position_limit_exceeded" in alerts
     assert "drawdown_limit_breached" in alerts
     assert "var_limit_exceeded" in alerts or "var_limit_warning" in alerts
+
+
+def test_build_risk_snapshot_includes_data_quality() -> None:
+    dates = pd.date_range("2024-06-01", periods=5, freq="D", tz="UTC")
+    history = pd.DataFrame({
+        "Close": [1900.0, 1910.0, 1920.0, 1915.0, 1925.0],
+        "Volume": [1000, 1050, 980, 990, 1010],
+    }, index=dates)
+    history.attrs["provider_key"] = "yfinance"
+    history.attrs["provider_label"] = "Yahoo Finance"
+    history.attrs["data_age_minutes"] = 25.0
+    history.attrs["data_last_timestamp"] = dates[-1].isoformat()
+    history.attrs["history_rows"] = len(history)
+
+    limits = RiskLimits(max_position_oz=4000, stress_var_millions=2.5, daily_drawdown_pct=3.0)
+
+    snapshot = build_risk_snapshot(
+        "XAUUSD",
+        history,
+        limits=limits,
+        current_position_oz=1000,
+        pnl_today_millions=0.2,
+        max_data_age_minutes=30,
+        data_provider="yfinance",
+        data_mode="hybrid",
+    )
+
+    dq = snapshot["data_quality"]
+    assert dq["provider"] == "yfinance"
+    assert dq["provider_label"] == "Yahoo Finance"
+    assert dq["max_age_minutes"] == 30
+    assert dq["fresh"] is True
+    assert dq["history_rows"] == len(history)

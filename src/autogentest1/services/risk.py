@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from math import isnan
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING
 
@@ -47,6 +48,19 @@ DEFAULT_SCENARIO_SHOCKS: Sequence[ScenarioShock] = (
     ScenarioShock(label="plus_1pct", pct_change=0.01),
     ScenarioShock(label="plus_2pct", pct_change=0.02),
 )
+
+
+def _infer_market_session(timestamp: datetime) -> str:
+    """Roughly bucket the current UTC hour into key trading sessions."""
+
+    hour = timestamp.hour
+    if 0 <= hour < 7:
+        return "asia"
+    if 7 <= hour < 13:
+        return "london"
+    if 13 <= hour < 21:
+        return "newyork"
+    return "off_hours"
 
 
 def adjust_limits_with_news(
@@ -288,6 +302,9 @@ def build_risk_snapshot(
     scenario_shocks: Sequence[ScenarioShock] = DEFAULT_SCENARIO_SHOCKS,
     news_snapshot: Optional[Mapping[str, Any]] = None,
     apply_news_adjustment: bool = True,
+    max_data_age_minutes: Optional[int] = None,
+    data_provider: Optional[str] = None,
+    data_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Compute realized and hypothetical risk metrics for the desk."""
 
@@ -320,6 +337,40 @@ def build_risk_snapshot(
             correlation_windows = (int(correlation_window),)
         else:
             correlation_windows = (20, 60, 120)
+
+    provider_key = None
+    provider_label = None
+    data_age_minutes: Optional[float] = None
+    last_timestamp: Optional[str] = None
+    history_rows: Optional[int] = None
+
+    if hasattr(history, "attrs"):
+        provider_key = str(history.attrs.get("provider_key") or "").lower() or None
+        provider_label = history.attrs.get("provider_label") or provider_key
+        age_attr = history.attrs.get("data_age_minutes")
+        if age_attr is not None:
+            try:
+                data_age_minutes = float(age_attr)
+            except (TypeError, ValueError):
+                data_age_minutes = None
+        last_timestamp = history.attrs.get("data_last_timestamp")
+        rows_attr = history.attrs.get("history_rows")
+        if rows_attr is not None:
+            try:
+                history_rows = int(rows_attr)
+            except (TypeError, ValueError):
+                history_rows = None
+    if data_provider and not provider_key:
+        provider_key = str(data_provider).lower()
+    if provider_label is None and provider_key is not None:
+        provider_label = provider_key
+
+    max_age_limit: Optional[float] = None
+    if max_data_age_minutes is not None:
+        try:
+            max_age_limit = float(max_data_age_minutes)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            max_age_limit = None
 
     if history.empty:
         logger.warning("缺少行情数据，无法计算风险快照：%s", symbol)
@@ -370,6 +421,10 @@ def build_risk_snapshot(
 
         liquidity_metrics = _compute_liquidity_metrics(history, latest_price)
 
+    fresh: Optional[bool] = None
+    if data_age_minutes is not None and max_age_limit is not None:
+        fresh = data_age_minutes <= max_age_limit
+
     utilization = (
         current_position_oz / effective_limits.max_position_oz if effective_limits.max_position_oz else None
     )
@@ -406,6 +461,9 @@ def build_risk_snapshot(
             risk_alerts.append("scenario_loss_exceeds_limit")
             break
 
+    snapshot_timestamp = datetime.now(timezone.utc)
+    market_session = _infer_market_session(snapshot_timestamp)
+
     snapshot: Dict[str, Any] = {
         "symbol": symbol,
         "current_position_oz": current_position_oz,
@@ -422,6 +480,16 @@ def build_risk_snapshot(
         "scenario_outcomes": scenario_outcomes,
         "cross_asset_correlations": cross_asset_correlations,
         "liquidity_metrics": liquidity_metrics,
+        "data_quality": {
+            "provider": provider_key,
+            "provider_label": provider_label,
+            "data_mode": str(data_mode).lower() if data_mode is not None else None,
+            "age_minutes": data_age_minutes,
+            "max_age_minutes": max_age_limit,
+            "fresh": fresh,
+            "history_rows": history_rows,
+            "last_timestamp": last_timestamp,
+        },
         "risk_alerts": risk_alerts,
         "latest_price": latest_price,
         "base_limits": {
@@ -435,5 +503,7 @@ def build_risk_snapshot(
             "daily_drawdown_pct": effective_limits.daily_drawdown_pct,
         },
         "news_adjustment": news_adjustment,
+        "snapshot_timestamp": snapshot_timestamp.isoformat(),
+        "market_session": market_session,
     }
     return snapshot

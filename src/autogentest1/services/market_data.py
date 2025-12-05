@@ -152,12 +152,16 @@ def _retry_fetch(
     ) from last_error
 
 
-def _ensure_freshness(history: pd.DataFrame, *, max_age_minutes: int) -> None:
+def _ensure_freshness(history: pd.DataFrame, *, max_age_minutes: int) -> Optional[float]:
+    """Validate market data freshness and annotate the dataframe."""
+
     if history.empty:
-        return
+        history.attrs.setdefault("data_age_minutes", None)
+        return None
     last_index = history.index.max()
     if last_index is None:
-        return
+        history.attrs.setdefault("data_age_minutes", None)
+        return None
     if isinstance(last_index, pd.Timestamp):
         last_dt = last_index.to_pydatetime()
     else:
@@ -168,10 +172,16 @@ def _ensure_freshness(history: pd.DataFrame, *, max_age_minutes: int) -> None:
     else:
         last_dt = last_dt.astimezone(timezone.utc)
     age = now_utc - last_dt
+    age_minutes = age.total_seconds() / 60 if age else 0.0
+
+    history.attrs["data_last_timestamp"] = last_dt.isoformat()
+    history.attrs["data_age_minutes"] = age_minutes
+
     if age > timedelta(minutes=max_age_minutes):
         raise DataStalenessError(
             f"最新行情已经超过{int(age.total_seconds() // 60)}分钟（上限{max_age_minutes}分钟）"
         )
+    return age_minutes
 
 
 def _normalized_provider(value: Optional[str]) -> str:
@@ -353,9 +363,11 @@ def fetch_price_history(symbol: str, days: int = 14) -> pd.DataFrame:
 
     data: Optional[pd.DataFrame] = None
     error: Optional[str] = None
+    selected_provider_key: Optional[str] = None
+    selected_provider_label: Optional[str] = None
 
     for index, (provider_key, _adapter, label) in enumerate(provider_chain):
-        data, error = _attempt_fetch_with_logging(
+        candidate, error = _attempt_fetch_with_logging(
             router,
             provider_key,
             symbol,
@@ -365,7 +377,10 @@ def fetch_price_history(symbol: str, days: int = 14) -> pd.DataFrame:
             settings=settings,
             provider_label=label,
         )
-        if data is not None:
+        if candidate is not None:
+            data = candidate
+            selected_provider_key = provider_key
+            selected_provider_label = label
             break
         if index < len(provider_chain) - 1:
             next_label = provider_chain[index + 1][2]
@@ -379,9 +394,17 @@ def fetch_price_history(symbol: str, days: int = 14) -> pd.DataFrame:
             logger.error("行情抓取失败：%s", error)
         return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Adj Close", "Volume"])
 
+    attrs_snapshot = dict(getattr(data, "attrs", {}))
     data = data.tail(days)
     data.index = pd.to_datetime(data.index)
-    _ensure_freshness(data, max_age_minutes=settings.market_data_max_age_minutes)
+    data.attrs.update(attrs_snapshot)
+    age_minutes = _ensure_freshness(data, max_age_minutes=settings.market_data_max_age_minutes)
+    if selected_provider_key:
+        data.attrs["provider_key"] = selected_provider_key
+    if selected_provider_label:
+        data.attrs["provider_label"] = selected_provider_label
+    data.attrs["data_age_minutes"] = age_minutes
+    data.attrs["history_rows"] = int(len(data))
     return data
 
 

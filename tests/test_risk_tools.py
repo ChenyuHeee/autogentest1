@@ -20,6 +20,9 @@ def test_compute_risk_profile_respects_overrides(monkeypatch) -> None:
         risk_news_coupling_enabled = False
         news_api_key = None
         alpha_vantage_api_key = None
+        market_data_max_age_minutes = 30
+        data_provider = "yfinance"
+        data_mode = "hybrid"
 
     captured: dict = {}
 

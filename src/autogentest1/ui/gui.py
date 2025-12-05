@@ -25,6 +25,8 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSpinBox,
     QStatusBar,
+    QTableWidget,
+    QTableWidgetItem,
     QTabWidget,
     QTextEdit,
     QTreeWidget,
@@ -183,7 +185,7 @@ class WorkflowWorker(QRunnable):
             handler.close()
 
     def _find_chart_path(self) -> str:
-        outputs_dir = Path(__file__).resolve().parents[2] / "outputs"
+        outputs_dir = Path(__file__).resolve().parent.parent / "outputs"
         candidate = outputs_dir / f"{self.symbol.lower()}_close.png"
         return str(candidate) if candidate.exists() else ""
 
@@ -223,9 +225,15 @@ class MainWindow(QMainWindow):
         # Summary tab
         self.summary_text = QTextEdit()
         self.summary_text.setReadOnly(True)
+        self.plan_table = QTableWidget(0, 2)
+        self.plan_table.setHorizontalHeaderLabels(["项目", "取值"])
+        self.plan_table.verticalHeader().setVisible(False)
+        self.plan_table.horizontalHeader().setStretchLastSection(True)
+        self.plan_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         summary_tab = QWidget()
         summary_layout = QVBoxLayout(summary_tab)
         summary_layout.addWidget(self.summary_text)
+        summary_layout.addWidget(self.plan_table)
 
         # Details tab
         self.detail_tree = QTreeWidget()
@@ -386,7 +394,7 @@ class MainWindow(QMainWindow):
         if not line:
             return
         cursor = self.logs_text.textCursor()
-        cursor.movePosition(QTextCursor.End)
+        cursor.movePosition(QTextCursor.MoveOperation.End)
         cursor.insertText(line)
         self.logs_text.setTextCursor(cursor)
         self.logs_text.ensureCursorVisible()
@@ -637,32 +645,190 @@ class MainWindow(QMainWindow):
         return None
 
     def _update_summary(self, result: Dict[str, Any]) -> None:
+        narrative = self._render_final_summary(result)
+        if narrative:
+            self.summary_text.setPlainText(narrative)
+        else:
+            phase = result.get("phase")
+            status = result.get("status")
+            summary = result.get("summary")
+            details = result.get("details") if isinstance(result.get("details"), dict) else {}
+            lines = []
+            if phase:
+                lines.append(f"阶段：{phase}")
+            if status:
+                lines.append(f"状态：{status}")
+            if summary:
+                lines.append(f"摘要：{summary}")
+            if details:
+                highlights = []
+                for key, value in details.items():
+                    if isinstance(value, (str, int, float)):
+                        highlights.append(f"{key}: {value}")
+                    elif isinstance(value, list):
+                        highlights.append(f"{key}: {len(value)} 条")
+                    elif isinstance(value, dict):
+                        highlights.append(f"{key}: {len(value)} 项")
+                if highlights:
+                    lines.append("详情概览：")
+                    lines.extend(f"  - {item}" for item in highlights[:10])
+            self.summary_text.setPlainText("\n".join(lines))
+
+        self._populate_plan_table(result)
+
+    def _render_final_summary(self, result: Dict[str, Any]) -> str:
+        if not isinstance(result, dict):
+            return ""
+
         phase = result.get("phase")
         status = result.get("status")
         summary = result.get("summary")
-        details = result.get("details") if isinstance(result.get("details"), dict) else {}
+        details_raw = result.get("details")
+        details = details_raw if isinstance(details_raw, dict) else {}
+        payload_raw = details.get("payload") if isinstance(details.get("payload"), dict) else None
+        payload = payload_raw if isinstance(payload_raw, dict) else details
+        trading_plan_raw = payload.get("trading_plan") if isinstance(payload.get("trading_plan"), dict) else None
+        trading_plan = trading_plan_raw if isinstance(trading_plan_raw, dict) else {}
+        base_plan_raw = trading_plan.get("base_plan") if isinstance(trading_plan.get("base_plan"), dict) else None
+        base_plan = base_plan_raw if isinstance(base_plan_raw, dict) else {}
+        alternate_plan_raw = trading_plan.get("alternate_plan") if isinstance(trading_plan.get("alternate_plan"), dict) else None
+        alternate_plan = alternate_plan_raw if isinstance(alternate_plan_raw, dict) else {}
+        execution_checklist_raw = payload.get("execution_checklist") if isinstance(payload.get("execution_checklist"), dict) else None
+        execution_checklist = execution_checklist_raw if isinstance(execution_checklist_raw, dict) else {}
+        risk_compliance_raw = payload.get("risk_compliance_signoff") if isinstance(payload.get("risk_compliance_signoff"), dict) else None
+        risk_compliance = risk_compliance_raw if isinstance(risk_compliance_raw, dict) else {}
+        operations_raw = payload.get("operations_handoff") if isinstance(payload.get("operations_handoff"), dict) else None
+        operations = operations_raw if isinstance(operations_raw, dict) else {}
 
-        lines = []
-        if phase:
-            lines.append(f"阶段：{phase}")
-        if status:
-            lines.append(f"状态：{status}")
+        lines: list[str] = []
+        if phase or status:
+            lines.append(f"阶段 {phase or '-'} · 状态 {status or '-'}")
         if summary:
-            lines.append(f"摘要：{summary}")
+            lines.append(summary)
 
-        if details:
-            highlights = []
-            for key, value in details.items():
-                if isinstance(value, (str, int, float)):
-                    highlights.append(f"{key}: {value}")
-                elif isinstance(value, list):
-                    highlights.append(f"{key}: {len(value)} 条")
-                elif isinstance(value, dict):
-                    highlights.append(f"{key}: {len(value)} 项")
-            if highlights:
-                lines.append("详情概览：")
-                lines.extend(f"  - {item}" for item in highlights[:10])
-        self.summary_text.setPlainText("\n".join(lines))
+        if base_plan:
+            position = base_plan.get("position_oz")
+            entry = base_plan.get("entry")
+            stop = base_plan.get("stop") or base_plan.get("stop_loss")
+            targets = base_plan.get("targets") if isinstance(base_plan.get("targets"), list) else []
+            target_str = ", ".join(self._format_number(t) for t in targets) if targets else "-"
+            lines.append(
+                "交易方案：在 XAUUSD 上以限价 {entry} 建立 {size} 盎司头寸，止损 {stop}，目标 {target}.".format(
+                    entry=self._format_number(entry),
+                    size=self._format_number(position),
+                    stop=self._format_number(stop),
+                    target=target_str,
+                )
+            )
+            rationale = base_plan.get("rationale")
+            if isinstance(rationale, str) and rationale.strip():
+                lines.append(f"方案依据：{rationale.strip()}")
+
+        if alternate_plan:
+            hedges = alternate_plan.get("hedges") if isinstance(alternate_plan.get("hedges"), list) else []
+            contingencies = alternate_plan.get("contingencies") if isinstance(alternate_plan.get("contingencies"), list) else []
+            if hedges:
+                lines.append("对冲策略：" + "；".join(str(item) for item in hedges))
+            if contingencies:
+                lines.append("应急预案：" + "；".join(str(item) for item in contingencies))
+
+        orders = execution_checklist.get("orders") if isinstance(execution_checklist.get("orders"), list) else []
+        if orders:
+            lines.append(f"执行指令：共 {len(orders)} 条，首单 {orders[0].get('type', 'LIMIT')} {self._format_number(orders[0].get('size_oz'))} 盎司 @ {self._format_number(orders[0].get('entry'))}。")
+
+        risk_review = risk_compliance.get("risk_review") if isinstance(risk_compliance.get("risk_review"), dict) else {}
+        compliance_review = risk_compliance.get("compliance_review") if isinstance(risk_compliance.get("compliance_review"), dict) else {}
+        if risk_review:
+            breaches = risk_review.get("breaches")
+            lines.append("风控核查：{}；VaR={}; 利用率={}.".format(
+                "无硬性违规" if not breaches else "存在待处理项",
+                self._format_number((risk_review.get("risk_metrics") or {}).get("var99")),
+                self._format_number((risk_review.get("risk_metrics") or {}).get("position_utilization")),
+            ))
+        if compliance_review:
+            approvals = compliance_review.get("approvals") if isinstance(compliance_review.get("approvals"), list) else []
+            if approvals:
+                lines.append("合规意见：" + "；".join(str(item) for item in approvals))
+
+        monitoring = payload.get("monitoring_triggers") if isinstance(payload.get("monitoring_triggers"), list) else []
+        if monitoring:
+            lines.append("监控触发条件：" + "；".join(str(item) for item in monitoring))
+
+        task_checklist = operations.get("task_checklist") if isinstance(operations.get("task_checklist"), list) else []
+        if task_checklist:
+            pending = sum(1 for task in task_checklist if isinstance(task, dict) and task.get("status") != "complete")
+            lines.append(f"后续操作：共 {len(task_checklist)} 项任务，其中 {pending} 项未完成。")
+
+        return "\n".join(lines).strip()
+
+    def _populate_plan_table(self, result: Dict[str, Any]) -> None:
+        self.plan_table.setRowCount(0)
+        if not isinstance(result, dict):
+            return
+        details_raw = result.get("details")
+        details = details_raw if isinstance(details_raw, dict) else {}
+        payload_raw = details.get("payload") if isinstance(details.get("payload"), dict) else None
+        payload = payload_raw if isinstance(payload_raw, dict) else details
+        trading_plan_raw = payload.get("trading_plan") if isinstance(payload.get("trading_plan"), dict) else None
+        trading_plan = trading_plan_raw if isinstance(trading_plan_raw, dict) else {}
+        base_plan_raw = trading_plan.get("base_plan") if isinstance(trading_plan.get("base_plan"), dict) else None
+        base_plan = base_plan_raw if isinstance(base_plan_raw, dict) else {}
+        alternate_plan_raw = trading_plan.get("alternate_plan") if isinstance(trading_plan.get("alternate_plan"), dict) else None
+        alternate_plan = alternate_plan_raw if isinstance(alternate_plan_raw, dict) else {}
+
+        rows: list[tuple[str, str]] = []
+        if base_plan:
+            rows.append(("方向/头寸", f"{self._format_number(base_plan.get('position_oz'))} 盎司"))
+            rows.append(("入场价格", self._format_number(base_plan.get("entry"))))
+            rows.append(("止损", self._format_number(base_plan.get("stop") or base_plan.get("stop_loss"))))
+            targets = base_plan.get("targets") if isinstance(base_plan.get("targets"), list) else []
+            rows.append(("目标价", ", ".join(self._format_number(t) for t in targets) if targets else "-"))
+        if alternate_plan:
+            hedges = alternate_plan.get("hedges") if isinstance(alternate_plan.get("hedges"), list) else []
+            contingencies = alternate_plan.get("contingencies") if isinstance(alternate_plan.get("contingencies"), list) else []
+            if hedges:
+                rows.append(("对冲", "；".join(str(item) for item in hedges)))
+            if contingencies:
+                rows.append(("应急", "；".join(str(item) for item in contingencies)))
+
+        execution_checklist_raw = payload.get("execution_checklist") if isinstance(payload.get("execution_checklist"), dict) else None
+        execution_checklist = execution_checklist_raw if isinstance(execution_checklist_raw, dict) else {}
+        orders = execution_checklist.get("orders") if isinstance(execution_checklist.get("orders"), list) else []
+        if orders:
+            primary = orders[0]
+            rows.append(("首条指令", f"{primary.get('type', 'LIMIT')} {self._format_number(primary.get('size_oz'))} 盎司 @ {self._format_number(primary.get('entry'))}"))
+
+        risk_compliance_raw = payload.get("risk_compliance_signoff") if isinstance(payload.get("risk_compliance_signoff"), dict) else None
+        risk_compliance = risk_compliance_raw if isinstance(risk_compliance_raw, dict) else {}
+        risk_review = risk_compliance.get("risk_review") if isinstance(risk_compliance.get("risk_review"), dict) else {}
+        if risk_review:
+            metrics = risk_review.get("risk_metrics") if isinstance(risk_review.get("risk_metrics"), dict) else {}
+            if metrics:
+                rows.append(("VaR(99%)", self._format_number(metrics.get("var99"))))
+                rows.append(("头寸利用率", self._format_number(metrics.get("position_utilization"))))
+
+        monitoring = payload.get("monitoring_triggers") if isinstance(payload.get("monitoring_triggers"), list) else []
+        if monitoring:
+            rows.append(("监控条件", "；".join(str(item) for item in monitoring)))
+
+        if not rows:
+            return
+
+        self.plan_table.setRowCount(len(rows))
+        for row_index, (key, value) in enumerate(rows):
+            self.plan_table.setItem(row_index, 0, QTableWidgetItem(str(key)))
+            self.plan_table.setItem(row_index, 1, QTableWidgetItem(str(value)))
+        self.plan_table.resizeColumnsToContents()
+
+    @staticmethod
+    def _format_number(value: Any) -> str:
+        if value is None:
+            return "-"
+        if isinstance(value, (int, float)):
+            if isinstance(value, int) or abs(value) >= 100:
+                return f"{value:.2f}"
+            return f"{value:.4f}"
+        return str(value)
 
     def _populate_tree(self, data: Any, parent: QTreeWidgetItem | None = None) -> None:
         if parent is None:
